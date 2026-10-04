@@ -17,7 +17,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8600048570:AAEESJG1PDTCVDgaao_1TpgPNE2TDBHt1Vw")
+# Environment Variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7940553702"))
 CHANNEL_USERNAME = "@TeleFeedBookChannel"  # Channel Username
 CHANNEL_LINK = "https://t.me/TeleFeedBookChannel"
@@ -27,10 +28,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection():
     if DATABASE_URL:
-        # Railways Cloud Environment
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
     else:
-        # Local Environment (Fallback to local Postgres if needed, or update connection details)
         conn = psycopg2.connect(
             dbname=os.getenv("DB_NAME", "fakebook"),
             user=os.getenv("DB_USER", "postgres"),
@@ -70,6 +69,16 @@ def init_db():
         PRIMARY KEY (post_id, user_id)
     );
     """)
+
+    # ကြည့်ပြီးသား ပို့စ်များ မှတ်ရန် Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS post_views (
+        user_id BIGINT,
+        post_id INT,
+        PRIMARY KEY (user_id, post_id)
+    );
+    """)
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -105,6 +114,33 @@ def get_force_join_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+# Helper: Random Unseen/Seen Post ID ဆွဲထုတ်ပေးမည့် Function
+def get_random_post_id(user_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # ၁။ မကြည့်ရသေးသော ပို့စ်များကို Random ရှာပါ
+    cursor.execute("""
+        SELECT post_id FROM posts 
+        WHERE post_id NOT IN (SELECT post_id FROM post_views WHERE user_id = %s)
+        ORDER BY RANDOM() LIMIT 1
+    """, (user_id,))
+    unseen_post = cursor.fetchone()
+
+    if unseen_post:
+        cursor.close()
+        conn.close()
+        return unseen_post[0]
+
+    # ၂။ အကယ်၍ မကြည့်ရသေးသည်များ မရှိတော့ပါက ကြည့်ပြီးသားများထဲမှ Random ပြပါ
+    cursor.execute("SELECT post_id FROM posts ORDER BY RANDOM() LIMIT 1")
+    any_post = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    return any_post[0] if any_post else None
+
+
 # Helper: Post UI Render လုပ်ပေးသည့် Function
 def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current_index: int = 0, total_posts: int = 0):
     conn = get_db_connection()
@@ -118,6 +154,13 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
         return None, None, None
 
     author_id, post_type, file_id, caption = post
+
+    # User ကြည့်ပြီးကြောင်း DB ထဲ မှတ်တမ်းတင်ပါ
+    cursor.execute("""
+        INSERT INTO post_views (user_id, post_id) VALUES (%s, %s)
+        ON CONFLICT (user_id, post_id) DO NOTHING
+    """, (user_id, post_id))
+    conn.commit()
 
     # Author Name with Mention Link
     cursor.execute("SELECT username FROM users WHERE user_id = %s", (author_id,))
@@ -151,16 +194,8 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
         if current_index < total_posts - 1:
             nav_buttons.append(InlineKeyboardButton("▶ Next", callback_data=f"profnav_{current_index + 1}"))
     else:
-        cursor.execute("SELECT post_id FROM posts WHERE post_id > %s ORDER BY post_id ASC LIMIT 1", (post_id,))
-        has_newer = cursor.fetchone()
-        
-        cursor.execute("SELECT post_id FROM posts WHERE post_id < %s ORDER BY post_id DESC LIMIT 1", (post_id,))
-        has_older = cursor.fetchone()
-
-        if has_newer:
-            nav_buttons.append(InlineKeyboardButton("◀️ Back Post", callback_data=f"feednav_{post_id}_prev"))
-        if has_older:
-            nav_buttons.append(InlineKeyboardButton("▶ Next Post", callback_data=f"feednav_{post_id}_next"))
+        # Feed မှာ Random ပို့စ်အသစ် ရယူနိုင်မည့် Next ခလုတ်
+        nav_buttons.append(InlineKeyboardButton("▶ Next Post", callback_data=f"feednav_{post_id}_next"))
 
     keyboard = [rec_buttons]
     if nav_buttons:
@@ -174,6 +209,10 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
             InlineKeyboardButton("🔥 Popular Posts", callback_data="open_popular"),
             InlineKeyboardButton("👤 မိမိ Profile", callback_data="open_my_profile")
         ])
+        
+        # Admin သီးသန့် Dele Button ထည့်သွင်းခြင်း
+        if user_id == ADMIN_ID:
+            keyboard.append([InlineKeyboardButton("🗑 Dele (Admin Only)", callback_data=f"admin_dele_{post_id}")])
 
     cursor.close()
     conn.close()
@@ -217,45 +256,6 @@ def get_profile_dashboard(user):
     cursor.close()
     conn.close()
     return profile_text, InlineKeyboardMarkup(keyboard)
-
-
-# Helper: Edit Message with Safety Catch
-async def edit_post_message(query, text, reply_markup, post_type, file_id):
-    try:
-        msg = query.message
-        is_media_msg = bool(msg.photo or msg.video)
-
-        if post_type == "photo":
-            if is_media_msg:
-                await query.edit_message_media(
-                    media=InputMediaPhoto(media=file_id, caption=text, parse_mode="Markdown"),
-                    reply_markup=reply_markup
-                )
-            else:
-                await msg.delete()
-                await msg.reply_photo(photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-        elif post_type == "video":
-            if is_media_msg:
-                await query.edit_message_media(
-                    media=InputMediaVideo(media=file_id, caption=text, parse_mode="Markdown"),
-                    reply_markup=reply_markup
-                )
-            else:
-                await msg.delete()
-                await msg.reply_video(video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            if is_media_msg:
-                await msg.delete()
-                await msg.reply_text(text=text, reply_markup=reply_markup, parse_mode="Markdown")
-            else:
-                await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode="Markdown")
-    except BadRequest as e:
-        if "Message is not modified" in str(e):
-            pass
-        else:
-            logging.error(f"Error editing message: {e}")
-    except Exception as e:
-        logging.error(f"Error editing message: {e}")
 
 
 # Helper: Popular Posts
@@ -399,18 +399,12 @@ async def show_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Feed ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
         return
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT post_id FROM posts ORDER BY post_id DESC LIMIT 1")
-    latest_post = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    post_id = get_random_post_id(user_id)
 
-    if not latest_post:
+    if not post_id:
         await update.message.reply_text("လောလောဆယ် Post မရှိသေးပါဘူး bro!", reply_to_message_id=update.message.message_id)
         return
 
-    post_id = latest_post[0]
     text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
 
     if post_type == "photo":
@@ -425,7 +419,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if not await check_channel_member(context.bot, user.id):
-        await update.message.reply_text("⚠️ Profile ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
+        await update.message.reply_text("⚠️️ Profile ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
         return
 
     profile_text, reply_markup = get_profile_dashboard(user)
@@ -503,7 +497,6 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=reply_msg.message_id
             )
             success += 1
-            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
 
@@ -554,8 +547,6 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data.split("_")
     post_id = int(data[1])
     selected_rec = data[2]
-    mode = data[3]
-    index = int(data[4]) if len(data) > 4 else 0
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -564,18 +555,15 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ON CONFLICT (post_id, user_id) DO UPDATE SET reaction = EXCLUDED.reaction
     """, (post_id, user_id, selected_rec))
     conn.commit()
-
-    is_profile = (mode == "prof")
-    total_posts = 0
-    if is_profile:
-        cursor.execute("SELECT COUNT(*) FROM posts WHERE user_id = %s", (user_id,))
-        total_posts = cursor.fetchone()[0]
-
     cursor.close()
     conn.close()
 
-    text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=is_profile, current_index=index, total_posts=total_posts)
-    await edit_post_message(query, text, reply_markup, post_type, file_id)
+    # Reaction ပေးပြီးရင် Inline Keyboard ကို သာမန်အတိုင်း Update ပြုလုပ်ပေးသည်
+    text, reply_markup, _ = render_post_ui(post_id, user_id, is_profile=False)
+    try:
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except Exception:
+        pass
 
 
 async def handle_feed_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,29 +576,67 @@ async def handle_feed_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    data = query.data.split("_")
-    current_post_id = int(data[1])
-    direction = data[2]
+    # စာဟောင်း/ပုံဟောင်းကို ဖျက်လိုက်မည်
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # Random Post ID အသစ်တစ်ခု ဆွဲယူမည်
+    post_id = get_random_post_id(user_id)
+
+    if not post_id:
+        await context.bot.send_message(chat_id=user_id, text="လောလောဆယ် Post များ မရှိသေးပါဘူး bro!")
+        return
+
+    text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
+
+    # Post အသစ်ကို အောက်သို့ ပို့ပေးမည်
+    if post_type == "photo":
+        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif post_type == "video":
+        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def handle_admin_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    # Admin ဟုတ်မဟုတ် စစ်ဆေးခြင်း
+    if user_id != ADMIN_ID:
+        await query.answer("❌ ဒီ ခလုတ်ကို Admin သီးသန့်သာ အသုံးပြုခွင့်ရှိပါတယ် bro!", show_alert=True)
+        return
+
+    post_id = int(query.data.split("_")[2])
 
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    if direction == "next":
-        cursor.execute("SELECT post_id FROM posts WHERE post_id < %s ORDER BY post_id DESC LIMIT 1", (current_post_id,))
-    else:
-        cursor.execute("SELECT post_id FROM posts WHERE post_id > %s ORDER BY post_id ASC LIMIT 1", (current_post_id,))
-
-    target_post = cursor.fetchone()
+    cursor.execute("DELETE FROM posts WHERE post_id = %s", (post_id,))
+    cursor.execute("DELETE FROM reactions WHERE post_id = %s", (post_id,))
+    cursor.execute("DELETE FROM post_views WHERE post_id = %s", (post_id,))
+    conn.commit()
     cursor.close()
     conn.close()
 
-    if not target_post:
-        await query.answer("နောက်ထပ် Post မရှိတော့ပါဘူး bro!", show_alert=True)
-        return
+    await query.answer("🗑 Post ကို အောင်မြင်စွာ ဖျက်လိုက်ပါပြီ Admin!", show_alert=True)
 
-    post_id = target_post[0]
-    text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-    await edit_post_message(query, text, reply_markup, post_type, file_id)
+    # Message ကို ဖျက်ပြီး Next Post သို့ ဆက်သွားပေးမည်
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    next_post_id = get_random_post_id(user_id)
+    if next_post_id:
+        text, reply_markup, (post_type, file_id) = render_post_ui(next_post_id, user_id, is_profile=False)
+        if post_type == "photo":
+            await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+        elif post_type == "video":
+            await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -634,11 +660,22 @@ async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Bro တင်ထားတဲ့ Post မရှိပါဘူး!", show_alert=True)
         return
 
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
     post_id = user_posts[0][0]
     text, reply_markup, (post_type, file_id) = render_post_ui(
         post_id, user_id, is_profile=True, current_index=0, total_posts=len(user_posts)
     )
-    await edit_post_message(query, text, reply_markup, post_type, file_id)
+    
+    if post_type == "photo":
+        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif post_type == "video":
+        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_profile_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -663,11 +700,22 @@ async def handle_profile_nav(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user_posts or target_index < 0 or target_index >= len(user_posts):
         return
 
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
     post_id = user_posts[target_index][0]
     text, reply_markup, (post_type, file_id) = render_post_ui(
         post_id, user_id, is_profile=True, current_index=target_index, total_posts=len(user_posts)
     )
-    await edit_post_message(query, text, reply_markup, post_type, file_id)
+
+    if post_type == "photo":
+        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif post_type == "video":
+        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -676,38 +724,24 @@ async def handle_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     data = query.data.split("_")
     post_id = int(data[2])
-    current_index = int(data[3])
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("DELETE FROM posts WHERE post_id = %s AND user_id = %s", (post_id, user_id))
     cursor.execute("DELETE FROM reactions WHERE post_id = %s", (post_id,))
+    cursor.execute("DELETE FROM post_views WHERE post_id = %s", (post_id,))
     conn.commit()
 
     await query.answer("🗑 Post ကို အောင်မြင်စွာ ဖျက်လိုက်ပါပြီ!", show_alert=True)
 
-    cursor.execute("SELECT post_id FROM posts WHERE user_id = %s ORDER BY post_id DESC", (user_id,))
-    remaining_posts = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
-    if not remaining_posts:
-        profile_text, reply_markup = get_profile_dashboard(query.from_user)
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
-        return
-
-    new_index = current_index if current_index < len(remaining_posts) else len(remaining_posts) - 1
-    next_post_id = remaining_posts[new_index][0]
-
-    text, reply_markup, (post_type, file_id) = render_post_ui(
-        next_post_id, user_id, is_profile=True, current_index=new_index, total_posts=len(remaining_posts)
-    )
-    await edit_post_message(query, text, reply_markup, post_type, file_id)
+    profile_text, reply_markup = get_profile_dashboard(query.from_user)
+    await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_back_to_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -718,13 +752,11 @@ async def handle_back_to_profile(update: Update, context: ContextTypes.DEFAULT_T
     profile_text, reply_markup = get_profile_dashboard(user)
 
     try:
-        if query.message.photo or query.message.video:
-            await query.message.delete()
-            await context.bot.send_message(chat_id=user.id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            await query.edit_message_text(profile_text, reply_markup=reply_markup, parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Error returning to profile: {e}")
+        await query.message.delete()
+    except Exception:
+        pass
+
+    await context.bot.send_message(chat_id=user.id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_open_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -732,25 +764,30 @@ async def handle_open_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
+        await query.answer("⚠️️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
 
     await query.answer()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT post_id FROM posts ORDER BY post_id DESC LIMIT 1")
-    latest_post = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
-    if not latest_post:
-        await query.answer("လောလောဆယ် Post မရှိသေးပါဘူး bro!", show_alert=True)
+    post_id = get_random_post_id(user_id)
+
+    if not post_id:
+        await context.bot.send_message(chat_id=user_id, text="လောလောဆယ် Post မရှိသေးပါဘူး bro!")
         return
 
-    post_id = latest_post[0]
     text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-    await edit_post_message(query, text, reply_markup, post_type, file_id)
+
+    if post_type == "photo":
+        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif post_type == "video":
+        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_open_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -763,16 +800,13 @@ async def handle_open_popular(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.answer()
 
-    msg, keyboard = get_popular_data(context.bot.username)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
 
-    if query.message.photo or query.message.video:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
-    else:
-        await query.edit_message_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    msg, keyboard = get_popular_data(context.bot.username)
+    await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
 
 
 # --- Main ---
@@ -794,6 +828,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_check_join, pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(handle_reaction, pattern="^rec_"))
     app.add_handler(CallbackQueryHandler(handle_feed_nav, pattern="^feednav_"))
+    app.add_handler(CallbackQueryHandler(handle_admin_delete_post, pattern="^admin_dele_"))
     app.add_handler(CallbackQueryHandler(handle_view_my_posts, pattern="^view_my_posts$"))
     app.add_handler(CallbackQueryHandler(handle_profile_nav, pattern="^profnav_"))
     app.add_handler(CallbackQueryHandler(handle_delete_post, pattern="^delete_post_"))
