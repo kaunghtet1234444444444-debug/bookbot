@@ -1,860 +1,793 @@
+import random
+import asyncio
 import logging
+import html
 import os
-import re
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     filters,
+    ContextTypes
 )
-from telegram.error import BadRequest
+from telegram.error import RetryAfter, BadRequest
 
-# Logging Setup
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# Logging Config
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Environment Variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7940553702"))
-CHANNEL_USERNAME = "@TeleFeedBookChannel"  # Channel Username
-CHANNEL_LINK = "https://t.me/TeleFeedBookChannel"
+# --- BOT TOKEN & ADMIN CONFIG ---
+TOKEN = os.getenv("BOT_TOKEN", "8847802267:AAFuOudnLo1CnSpu3YcLSZZ56gMM9aLVloA")
+BOT_ADMIN_ID = int(os.getenv("ADMIN_ID", "7940553702"))
 
-# DATABASE CONNECTION (PostgreSQL Support for Railway)
+# --- DATABASE CONNECTION POOL ---
 DATABASE_URL = os.getenv("DATABASE_URL")
+db_pool = None
 
-def get_db_connection():
-    if DATABASE_URL:
-        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    else:
-        conn = psycopg2.connect(
-            dbname=os.getenv("DB_NAME", "fakebook"),
-            user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD", "postgres"),
-            host=os.getenv("DB_HOST", "localhost"),
-            port=os.getenv("DB_PORT", "5432")
-        )
-    return conn
+def init_db_pool():
+    global db_pool
+    try:
+        if DATABASE_URL:
+            db_pool = pool.SimpleConnectionPool(1, 20, DATABASE_URL, sslmode="require")
+        else:
+            db_pool = pool.SimpleConnectionPool(
+                1, 20,
+                dbname=os.getenv("DB_NAME", "football_bot"),
+                user=os.getenv("DB_USER", "postgres"),
+                password=os.getenv("DB_PASSWORD", "postgres"),
+                host=os.getenv("DB_HOST", "localhost"),
+                port=os.getenv("DB_PORT", "5432")
+            )
+        logger.info("Database Connection Pool initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Connection Pool: {e}")
 
-# Database Tables Initialization
+class get_db:
+    """Context Manager for Database Connections using Connection Pool"""
+    def __enter__(self):
+        self.conn = db_pool.getconn()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type:
+                self.conn.rollback()
+            else:
+                self.conn.commit()
+            db_pool.putconn(self.conn)
+
+# Initialize Database Tables
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT
-    );
-    """)
+    init_db_pool()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            first_name TEXT,
+            coins INT DEFAULT 0
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            chat_id BIGINT PRIMARY KEY,
+            title TEXT
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS group_users (
+            chat_id BIGINT,
+            user_id BIGINT,
+            PRIMARY KEY (chat_id, user_id)
+        );
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            type TEXT
+        );
+        """)
+        cursor.close()
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS posts (
-        post_id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        post_type TEXT,
-        file_id TEXT,
-        caption TEXT
-    );
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS reactions (
-        post_id INT,
-        user_id BIGINT,
-        reaction TEXT,
-        PRIMARY KEY (post_id, user_id)
-    );
-    """)
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS post_views (
-        user_id BIGINT,
-        post_id INT,
-        PRIMARY KEY (user_id, post_id)
-    );
-    """)
-
-    # Group Settings Table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS group_settings (
-        chat_id BIGINT PRIMARY KEY,
-        msg_limit INT DEFAULT 20,
-        current_count INT DEFAULT 0
-    );
-    """)
-
-    # Group များတွင် ကျပြီးသား Post များ မှတ်ရန် Table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS group_post_history (
-        chat_id BIGINT,
-        post_id INT,
-        PRIMARY KEY (chat_id, post_id)
-    );
-    """)
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-# Initialize Database
+# Start Initial DB Setup
 init_db()
 
+# --- DATABASE HELPER FUNCTIONS ---
 
-# Helper: Markdown Text Escape
-def escape_markdown(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r'([_*`\[\]])', r'\\\1', str(text))
-
-
-# Helper: Check Force Join
-async def check_channel_member(bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        if member.status in ["creator", "administrator", "member"]:
-            return True
-        return False
-    except Exception as e:
-        logging.error(f"Error checking channel membership: {e}")
-        return False
-
-
-def get_force_join_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("🔄 Try Again / ပြီးပါပြီ", callback_data="check_join")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-# Helper: Random Unseen Post ID (User DM အတွက်)
-def get_random_post_id(user_id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT post_id FROM posts 
-        WHERE post_id NOT IN (SELECT post_id FROM post_views WHERE user_id = %s)
-        ORDER BY RANDOM() LIMIT 1
-    """, (user_id,))
-    unseen_post = cursor.fetchone()
-
-    if unseen_post:
-        cursor.close()
-        conn.close()
-        return unseen_post[0]
-
-    cursor.execute("SELECT post_id FROM posts ORDER BY RANDOM() LIMIT 1")
-    any_post = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    return any_post[0] if any_post else None
-
-
-# Helper: Random Post ID (Group များအတွက် - မကျဖူးသေးတာ အရင်ရွေးမည်)
-def get_random_group_post_id(chat_id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT post_id FROM posts 
-        WHERE post_id NOT IN (SELECT post_id FROM group_post_history WHERE chat_id = %s)
-        ORDER BY RANDOM() LIMIT 1
-    """, (chat_id,))
-    unseen_post = cursor.fetchone()
-
-    if unseen_post:
-        post_id = unseen_post[0]
-        cursor.execute("INSERT INTO group_post_history (chat_id, post_id) VALUES (%s, %s)", (chat_id, post_id))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return post_id
-
-    # အကုန်ကျဖူးသွားရင် History ရှင်းပြီး Random ပြန်စမည်
-    cursor.execute("DELETE FROM group_post_history WHERE chat_id = %s", (chat_id,))
-    conn.commit()
-
-    cursor.execute("SELECT post_id FROM posts ORDER BY RANDOM() LIMIT 1")
-    any_post = cursor.fetchone()
-    if any_post:
-        cursor.execute("INSERT INTO group_post_history (chat_id, post_id) VALUES (%s, %s)", (chat_id, any_post[0]))
-        conn.commit()
-
-    cursor.close()
-    conn.close()
-    return any_post[0] if any_post else None
-
-
-# Helper: Post UI Render (DM နှင့် Group ခွဲခြားထားပါသည်)
-def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current_index: int = 0, total_posts: int = 0, is_group: bool = False):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT user_id, post_type, file_id, caption FROM posts WHERE post_id = %s", (post_id,))
-    post = cursor.fetchone()
-    if not post:
-        cursor.close()
-        conn.close()
-        return None, None, None
-
-    author_id, post_type, file_id, caption = post
-
-    if not is_group:
+def db_add_or_update_user(user_id, first_name):
+    with get_db() as conn:
+        cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO post_views (user_id, post_id) VALUES (%s, %s)
-            ON CONFLICT (user_id, post_id) DO NOTHING
-        """, (user_id, post_id))
-        conn.commit()
+            INSERT INTO users (user_id, first_name) VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET first_name = EXCLUDED.first_name
+        """, (user_id, first_name))
+        cursor.close()
 
-    cursor.execute("SELECT username FROM users WHERE user_id = %s", (author_id,))
-    author = cursor.fetchone()
-    raw_author_name = author[0] if author else "Unknown"
-    safe_author_name = escape_markdown(raw_author_name)
-    
-    header = f"👤 [{safe_author_name}](tg://user?id={author_id})\n"
-    if is_profile:
-        header += f"📌 Post ({current_index + 1}/{total_posts})\n"
-    
-    body = f"\n{escape_markdown(caption)}" if caption else ""
-    text = f"{header}{body}"
+def db_add_group(chat_id, title):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO groups (chat_id, title) VALUES (%s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+        """, (chat_id, title))
+        cursor.close()
 
-    # Reaction Counts
-    reactions_list = ["😂", "❤️", "💩", "👍"]
-    counts = {}
-    for r in reactions_list:
-        cursor.execute("SELECT COUNT(*) FROM reactions WHERE post_id = %s AND reaction = %s", (post_id, r))
-        counts[r] = cursor.fetchone()[0]
+def db_add_group_user(chat_id, user_id):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO group_users (chat_id, user_id) VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+        """, (chat_id, user_id))
+        cursor.close()
 
-    rec_buttons = [
-        InlineKeyboardButton(f"{r} {counts[r]}", callback_data=f"rec_{post_id}_{r}_{'grp' if is_group else 'dm'}")
-        for r in reactions_list
-    ]
+def db_add_coins(user_id, reward):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET coins = coins + %s WHERE user_id = %s
+        """, (reward, user_id))
+        cursor.close()
 
-    keyboard = [rec_buttons]
+def db_get_user_info(user_id):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT first_name, coins FROM users WHERE user_id = %s", (user_id,))
+        res = cursor.fetchone()
+        cursor.close()
+        return res
 
-    # Group မဟုတ်မှသာ Next, Profile, Popular ခလုတ်များ ထည့်မည်
-    if not is_group:
-        nav_buttons = []
-        if is_profile:
-            if current_index > 0:
-                nav_buttons.append(InlineKeyboardButton("◀️ Back", callback_data=f"profnav_{current_index - 1}"))
-            if current_index < total_posts - 1:
-                nav_buttons.append(InlineKeyboardButton("▶ Next", callback_data=f"profnav_{current_index + 1}"))
-        else:
-            nav_buttons.append(InlineKeyboardButton("▶ Next Post", callback_data=f"feednav_{post_id}_next"))
+def db_get_setting(key, default=None):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value, type FROM settings WHERE key = %s", (key,))
+        res = cursor.fetchone()
+        cursor.close()
+        if res:
+            return res[0], res[1]
+        return default, None
 
-        if nav_buttons:
-            keyboard.append(nav_buttons)
-            
-        if is_profile:
-            keyboard.append([InlineKeyboardButton("🗑 Delete This Post", callback_data=f"delete_post_{post_id}_{current_index}")])
-            keyboard.append([InlineKeyboardButton("⬅ Back to Profile", callback_data="back_to_profile")])
-        else:
-            keyboard.append([
-                InlineKeyboardButton("🔥 Popular Posts", callback_data="open_popular"),
-                InlineKeyboardButton("👤 မိမိ Profile", callback_data="open_my_profile")
-            ])
-            
-            if user_id == ADMIN_ID:
-                keyboard.append([InlineKeyboardButton("🗑 Dele (Admin Only)", callback_data=f"admin_dele_{post_id}")])
+def db_set_setting(key, value, media_type=None):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO settings (key, value, type) VALUES (%s, %s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, type = EXCLUDED.type
+        """, (key, str(value), media_type))
+        cursor.close()
 
-    cursor.close()
-    conn.close()
-    return text, InlineKeyboardMarkup(keyboard), (post_type, file_id)
-
-
-# Helper: Profile Dashboard Text & Keyboard
-def get_profile_dashboard(user):
-    user_id = user.id
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE user_id = %s", (user_id,))
-    total_posts = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT reaction, COUNT(*) 
-        FROM reactions 
-        WHERE post_id IN (SELECT post_id FROM posts WHERE user_id = %s) 
-        GROUP BY reaction
-    """, (user_id,))
-    
-    rec_results = dict(cursor.fetchall())
-    reactions_list = ["😂", "❤️", "💩", "👍"]
-    rec_summary = " | ".join([f"{r} {rec_results.get(r, 0)}" for r in reactions_list])
-
-    profile_text = (
-        f"👤 **User Profile**\n\n"
-        f"• **Name:** [{escape_markdown(user.first_name)}](tg://user?id={user_id})\n"
-        f"• **ID:** `{user_id}`\n"
-        f"• **Total Posts:** {total_posts}\n\n"
-        f"📊 **Total Reactions Received:**\n"
-        f"{rec_summary}"
-    )
-
-    keyboard = []
-    if total_posts > 0:
-        keyboard.append([InlineKeyboardButton("🖼 မိမိ Post များကို ကြည့်ရန်", callback_data="view_my_posts")])
-    keyboard.append([InlineKeyboardButton("📰 Feed ကြည့်ရန်", callback_data="open_feed")])
-
-    cursor.close()
-    conn.close()
-    return profile_text, InlineKeyboardMarkup(keyboard)
+def db_delete_setting(key):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM settings WHERE key = %s", (key,))
+        cursor.close()
 
 
-# Helper: Popular Posts
-def get_popular_data(bot_username: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+# --- TEAMS DATA ---
+TEAMS = {
+    # Premier League
+    "Arsenal": {"emoji": "🔴⚪", "stadium": "Emirates Stadium"},
+    "Aston Villa": {"emoji": "🦁🟣", "stadium": "Villa Park"},
+    "Bournemouth": {"emoji": "🍒🔴", "stadium": "Vitality Stadium"},
+    "Brentford": {"emoji": "🐝🔴", "stadium": "Gtech Community Stadium"},
+    "Brighton": {"emoji": "🔵⚪️", "stadium": "Amex Stadium"},
+    "Chelsea": {"emoji": "🔵", "stadium": "Stamford Bridge"},
+    "Crystal Palace": {"emoji": "🦅🔵", "stadium": "Selhurst Park"},
+    "Everton": {"emoji": "🔵⚪️", "stadium": "Goodison Park"},
+    "Fulham": {"emoji": "⚪⚫️", "stadium": "Craven Cottage"},
+    "Ipswich Town": {"emoji": "🚜🔵", "stadium": "Portman Road"},
+    "Leicester City": {"emoji": "🦊🔵", "stadium": "King Power Stadium"},
+    "Liverpool": {"emoji": "🔴", "stadium": "Anfield"},
+    "Manchester City": {"emoji": "🩵", "stadium": "Etihad Stadium"},
+    "Manchester United": {"emoji": "🔴😈", "stadium": "Old Trafford"},
+    "Newcastle United": {"emoji": "⚪️⚫️", "stadium": "St James' Park"},
+    "Nottingham Forest": {"emoji": "🌳🔴", "stadium": "City Ground"},
+    "Southampton": {"emoji": "🔴⚪️", "stadium": "St Mary's Stadium"},
+    "Tottenham Hotspur": {"emoji": "⚪️", "stadium": "Tottenham Hotspur Stadium"},
+    "West Ham United": {"emoji": "⚒️🟣", "stadium": "London Stadium"},
+    "Wolverhampton Wanderers": {"emoji": "🐺🟠", "stadium": "Molineux Stadium"},
 
-    cursor.execute("""
-        SELECT p.post_id, p.user_id, u.username, COUNT(r.reaction) as total_recs
-        FROM posts p
-        LEFT JOIN reactions r ON p.post_id = r.post_id
-        LEFT JOIN users u ON p.user_id = u.user_id
-        GROUP BY p.post_id, p.user_id, u.username
-        ORDER BY total_recs DESC
-        LIMIT 10
-    """)
-    top_posts = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    # Top European Clubs
+    "Real Madrid": {"emoji": "👑⚪", "stadium": "Santiago Bernabéu"},
+    "Barcelona": {"emoji": "🔵🔴", "stadium": "Camp Nou"},
+    "Atletico Madrid": {"emoji": "🔴⚪", "stadium": "Cívitas Metropolitano"},
+    "Bayern Munich": {"emoji": "🔴🔴", "stadium": "Allianz Arena"},
+    "Borussia Dortmund": {"emoji": "🟡⚫️", "stadium": "Signal Iduna Park"},
+    "Bayer Leverkusen": {"emoji": "🔴⚫️", "stadium": "BayArena"},
+    "Juventus": {"emoji": "⚪⚫", "stadium": "Allianz Stadium"},
+    "Inter Milan": {"emoji": "🔵⚫", "stadium": "San Siro"},
+    "AC Milan": {"emoji": "🔴⚫", "stadium": "San Siro"},
+    "PSG": {"emoji": "🔵🔴", "stadium": "Parc des Princes"}
+}
 
-    if not top_posts:
-        return "လောလောဆယ် Post များ မရှိသေးပါဘူး bro!", InlineKeyboardMarkup([[InlineKeyboardButton("📰 Feed သို့ ပြန်သွားရန်", callback_data="open_feed")]])
+# --- GLOBAL RUNTIME MEMORY & CACHE ---
+group_counters = {}   # {chat_id: int}
+active_games = {}     # {chat_id: game_data}
+last_result_data = {} # {chat_id: {"text": str, "markup": InlineKeyboardMarkup}}
+CACHE_SETTINGS = {"threshold": 6}
 
-    msg = "🔥 **Top 10 Popular Posts Leaderboard** 🔥\n\n"
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+def load_cached_threshold():
+    val, _ = db_get_setting("global_threshold")
+    if val:
+        CACHE_SETTINGS["threshold"] = int(val)
 
-    for idx, (post_id, user_id, username, total_recs) in enumerate(top_posts):
-        name = escape_markdown(username) if username else "Unknown"
-        medal = medals[idx] if idx < len(medals) else f"{idx+1}."
-        
-        post_link = f"https://t.me/{bot_username}?start=view_{post_id}"
-        msg += f"{medal} [{name}](tg://user?id={user_id}) - **{total_recs} Recs** | [👁 ကြည့်ရန်]({post_link})\n"
+load_cached_threshold()
 
-    keyboard = [[InlineKeyboardButton("📰 Feed သို့ ပြန်သွားရန်", callback_data="open_feed")]]
-    return msg, InlineKeyboardMarkup(keyboard)
+def get_mention(user_id, name):
+    safe_name = html.escape(str(name))
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
-
-# --- Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Group ထဲတွင် /start ခေါ်ပါက မည်သည့်အရာမှ ပြန်မလုပ်ပါ
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
-    user = update.effective_user
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO users (user_id, username) VALUES (%s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-    """, (user.id, user.first_name))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    if not await check_channel_member(context.bot, user.id):
-        await update.message.reply_text(
-            "⚠️ Bot ကို အသုံးပြုရန်အတွက် အောက်ပါ Channel ကို မဖြစ်မနေ Join ပေးရန် လိုအပ်ပါတယ် bro!",
-            reply_markup=get_force_join_keyboard(),
-            reply_to_message_id=update.message.message_id
-        )
-        return
-
-    if context.args and context.args[0].startswith("view_"):
-        try:
-            post_id = int(context.args[0].split("_")[1])
-            text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user.id, is_profile=False)
-            
-            if text:
-                if post_type == "photo":
-                    await update.message.reply_photo(photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-                elif post_type == "video":
-                    await update.message.reply_video(video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-                else:
-                    await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-                return
-            else:
-                await update.message.reply_text("❌ ဒီ Post မရှိတော့ပါဘူး bro!", reply_to_message_id=update.message.message_id)
-                return
-        except Exception:
-            pass
-
-    msg = (
-        f"မင်္ဂလာပါ {escape_markdown(user.first_name)} bro! 🚀\n\n"
-        "📌 **အသုံးပြုနည်းများ:**\n"
-        "• **Post တင်ရန်:** စာ/ပုံ/Video ကို Reply (rp) ထောက်ပြီး `/post` ဟု ရိုက်ပါ။\n"
-        "• `/feed` - Post များကို တလှည့်စီ ကြည့်ရန်/Reaction ပေးရန်\n"
-        "• `/profile` - မိမိ Profile Dashboard ကြည့်ရန်\n"
-        "• `/popular` - Popular Post များဆီ သွားရောက်ကြည့်ရှုရန်"
-    )
-    
-    # Add to Group Button ထည့်သွင်းခြင်း
-    bot_username = context.bot.username
-    add_group_url = f"https://t.me/{bot_username}?startgroup=true"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add to Group", url=add_group_url)]
-    ])
-
-    await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-
-
-async def create_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
-    user_id = update.effective_user.id
-
-    if not await check_channel_member(context.bot, user_id):
-        await update.message.reply_text(
-            "⚠️ Post မတင်မီ အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!",
-            reply_markup=get_force_join_keyboard(),
-            reply_to_message_id=update.message.message_id
-        )
-        return
-
-    reply_msg = update.message.reply_to_message
-
-    if not reply_msg:
-        await update.message.reply_text("❌ ကျေးဇူးပြုပြီး Post တင်ချင်တဲ့ စာ/ပုံ/Video Message ကို Reply (rp) ထောက်ပြီး `/post` လို့ ရိုက်ပေးပါ bro!", reply_to_message_id=update.message.message_id)
-        return
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO users (user_id, username) VALUES (%s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-    """, (user_id, update.effective_user.first_name))
-
-    post_type = "text"
-    file_id = None
-    caption = reply_msg.text or reply_msg.caption or ""
-
-    if reply_msg.photo:
-        post_type = "photo"
-        file_id = reply_msg.photo[-1].file_id
-    elif reply_msg.video:
-        post_type = "video"
-        file_id = reply_msg.video.file_id
-
-    cursor.execute(
-        "INSERT INTO posts (user_id, post_type, file_id, caption) VALUES (%s, %s, %s, %s)",
-        (user_id, post_type, file_id, caption)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    await update.message.reply_text("✅ Post ကို အောင်မြင်စွာ တင်ပြီးပါပြီ bro!", reply_to_message_id=update.message.message_id)
-
-
-async def show_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
-    user_id = update.effective_user.id
-
-    if not await check_channel_member(context.bot, user_id):
-        await update.message.reply_text("⚠️ Feed ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
-        return
-
-    post_id = get_random_post_id(user_id)
-
-    if not post_id:
-        await update.message.reply_text("လောလောဆယ် Post မရှိသေးပါဘူး bro!", reply_to_message_id=update.message.message_id)
-        return
-
-    text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-
-    if post_type == "photo":
-        await update.message.reply_photo(photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-    elif post_type == "video":
-        await update.message.reply_video(video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-    else:
-        await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-
-
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
+# Admin Command: /c <number>
+async def set_counter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     user = update.effective_user
 
-    if not await check_channel_member(context.bot, user.id):
-        await update.message.reply_text("⚠ Profile ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("❌ ဒီ Command ကို Group ထဲတွင်သာ သုံးပါ။")
         return
 
-    profile_text, reply_markup = get_profile_dashboard(user)
-    await update.message.reply_text(profile_text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id, user.id)
+        is_group_admin = chat_member.status in ["creator", "administrator"]
+    except Exception:
+        is_group_admin = False
 
+    is_bot_admin = (user.id == BOT_ADMIN_ID)
 
-async def show_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
-    if not await check_channel_member(context.bot, update.effective_user.id):
-        await update.message.reply_text("⚠️ Popular Posts ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
-        return
-
-    msg, keyboard = get_popular_data(context.bot.username)
-    await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-
-
-# --- Admin Command: /add ---
-async def set_group_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return
-
-    if update.effective_chat.type not in ["group", "supergroup"]:
-        await update.message.reply_text("❌ ဒီ Command ကို Group ထဲမှာပဲ သုံးလို့ရပါတယ် bro!")
+    if not (is_group_admin or is_bot_admin):
+        await update.message.reply_text("❌ ဒီ Command ကို Admin များသာ သုံးနိုင်ပါသည်။")
         return
 
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("❌ ကျေးဇူးပြုပြီး ဂဏန်းထည့်ပေးပါ။ ဥပမာ - `/add 20`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ စာကြောင်း အရေအတွက် ကိန်းဂဏန်း ထည့်ပေးပါ။\nဥပမာ - `/c 6`", parse_mode="HTML")
         return
 
-    limit = int(context.args[0])
+    new_threshold = int(context.args[0])
+    await asyncio.to_thread(db_set_setting, "global_threshold", new_threshold)
+    CACHE_SETTINGS["threshold"] = new_threshold
+
+    await update.message.reply_text(f"🌐 <b>Global Setting Updated:</b>\nGroup အားလုံးအတွက် စာကြောင်း <b>{new_threshold}</b> ကြောင်း ပြည့်တိုင်း ဂိမ်းစတင်ပါမည်။", parse_mode="HTML")
+
+# Start Command
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await asyncio.to_thread(db_add_or_update_user, user.id, user.first_name)
+    bot_info = await context.bot.get_me()
+    
+    first_name_safe = html.escape(user.first_name) if user.first_name else "User"
+    bot_name_safe = html.escape(bot_info.first_name) if bot_info.first_name else "Bot"
+
+    start_text = (
+        f"👋 မင်္ဂလာပါ <b>{first_name_safe}</b>!\n\n"
+        f"⚽ <b>{bot_name_safe}</b> မှ ကြိုဆိုပါတယ်။\n"
+        f"ဒီ Bot ဟာ Group ထဲမှာ ဘောလုံးပွဲစဉ်များကို ခန့်မှန်းပြီး 🩸 <b>Kachin Coin</b> များ စုဆောင်းနိုင်မည့် Game Bot ဖြစ်ပါတယ်။\n\n"
+        f"📌 <b>အဓိက Commands များ -</b>\n"
+        f"• `/kc` - မိမိ၏ Coin ပမာဏနှင့် Rank ကို စစ်ဆေးရန်\n"
+        f"• `/c &lt;ပမာဏ&gt;` - Group Admin များ စာကြောင်းအရေအတွက် သတ်မှတ်ရန်\n\n"
+        f"👇 အောက်ပါ Button ကို နှိပ်ပြီး သင့် Group သို့ Bot ကို ထည့်သွင်းနိုင်ပါသည်-"
+    )
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add To Group", url=f"https://t.me/{bot_info.username}?startgroup=true")]
+    ])
+    
+    await update.message.reply_text(start_text, parse_mode="HTML", reply_markup=keyboard)
+
+# Admin Panel Command
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != BOT_ADMIN_ID:
+        return
+
+    admin_text = (
+        f"👑 <b>Bot Admin Commands Panel</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🛠️ <b>Media Settings:</b>\n"
+        f"• `/g set` (Reply to Photo/Video) - Game စချိန် Media သတ်မှတ်ရန်\n"
+        f"• `/g del` - Game Media ပြန်ဖျက်ရန်\n"
+        f"• `/r set` (Reply to Photo/Video) - Result ထွက်ချိန် Media သတ်မှတ်ရန်\n"
+        f"• `/r del` - Result Media ပြန်ဖျက်ရန်\n\n"
+        f"⚙️ <b>System Controls:</b>\n"
+        f"• `/c &lt;အရေအတွက်&gt;` - စာကြောင်း အရေအတွက် သတ်မှတ်ရန်\n"
+        f"• `/stats` - User နှင့် Group စာရင်း ကြည့်ရန်\n"
+        f"• `/broadcast` (Reply to Message) - User/Group အားလုံးသို့ စာပို့ရန်\n"
+    )
+    await update.message.reply_text(admin_text, parse_mode="HTML")
+
+# Custom Game & Result Media Setters (Admin Only)
+async def media_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != BOT_ADMIN_ID:
+        return
+
+    cmd = update.message.text.strip().split()
+    if not cmd:
+        return
+
+    main_cmd = cmd[0].lower()
+    sub_cmd = cmd[1].lower() if len(cmd) > 1 else ""
+
+    setting_key = "game_media" if main_cmd == "/g" else ("result_media" if main_cmd == "/r" else None)
+    if setting_key is None:
+        return
+
+    if sub_cmd == "set":
+        reply = update.message.reply_to_message
+        if not reply:
+            await update.message.reply_text("⚠️ ပုံ သို့မဟုတ် ဗီဒီယိုကို Reply ထောက်ပြီး မိန့်ခွန်းပေးပါ။")
+            return
+
+        if reply.photo:
+            await asyncio.to_thread(db_set_setting, setting_key, reply.photo[-1].file_id, "photo")
+            await update.message.reply_text("✅ Photo ကို အောင်မြင်စွာ သတ်မှတ်လိုက်ပါပြီ။")
+        elif reply.video:
+            await asyncio.to_thread(db_set_setting, setting_key, reply.video.file_id, "video")
+            await update.message.reply_text("✅ Video ကို အောင်မြင်စွာ သတ်မှတ်လိုက်ပါပြီ။")
+        else:
+            await update.message.reply_text("❌ Photo သို့မဟုတ် Video မဟုတ်ပါ။")
+
+    elif sub_cmd == "del":
+        await asyncio.to_thread(db_delete_setting, setting_key)
+        await update.message.reply_text("🗑️ Media ကို ဖျက်လိုက်ပါပြီ။")
+
+# Stats Command
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != BOT_ADMIN_ID:
+        return
+
+    def get_stats():
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users")
+            u_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM groups")
+            g_count = cursor.fetchone()[0]
+            cursor.close()
+            return u_count, g_count
+
+    total_users, total_groups = await asyncio.to_thread(get_stats)
+
+    msg = (
+        f"📊 <b>BOT STATISTICS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Total Users:</b> <code>{total_users}</code>\n"
+        f"🏰 <b>Total Groups:</b> <code>{total_groups}</code>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+# Broadcast Command
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != BOT_ADMIN_ID:
+        return
+
+    reply = update.message.reply_to_message
+    if not reply:
+        await update.message.reply_text("⚠️ Broadcast လုပ်လိုသည့် Message ကို Reply ထောက်၍ `/broadcast` ဟု ရိုက်ပါ။")
+        return
+
+    status_msg = await update.message.reply_text("🚀 Broadcast စတင်ပို့ဆောင်နေပါသည်...")
+
+    def get_broadcast_targets():
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users")
+            users = [row[0] for row in cursor.fetchall()]
+            cursor.execute("SELECT chat_id FROM groups")
+            groups = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            return list(set(users) | set(groups))
+
+    targets = await asyncio.to_thread(get_broadcast_targets)
+    success = 0
+    failed = 0
+
+    for chat_id in targets:
+        try:
+            await context.bot.copy_message(chat_id=chat_id, from_chat_id=reply.chat_id, message_id=reply.message_id)
+            success += 1
+            await asyncio.sleep(0.04) # Telegram Rate Limit Protection
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await context.bot.copy_message(chat_id=chat_id, from_chat_id=reply.chat_id, message_id=reply.message_id)
+                success += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(f"✅ <b>Broadcast ပြီးစီးပါပြီ!</b>\n\n🎯 Success: {success}\n❌ Failed: {failed}", parse_mode="HTML")
+
+# Message Handler & Trigger
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+
     chat_id = update.effective_chat.id
+    user = update.effective_user
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO group_settings (chat_id, msg_limit, current_count) 
-        VALUES (%s, %s, 0)
-        ON CONFLICT (chat_id) DO UPDATE SET msg_limit = EXCLUDED.msg_limit
-    """, (chat_id, limit))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    await update.message.reply_text(f"✅ ဒီ Group အတွက် Message `{limit}` ကြောင်း ပြည့်တိုင်း Post တစ်ခု အလိုအလျောက် ကျလာပါမည် bro!", parse_mode="Markdown")
-
-
-# --- Group Message Listener & Random Post Sender ---
-async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ["group", "supergroup"]:
+    if update.effective_chat.type == "private":
+        if user:
+            await asyncio.to_thread(db_add_or_update_user, user.id, user.first_name)
         return
 
-    chat_id = chat.id
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    # Track Group and Users
+    if update.effective_chat.title:
+        await asyncio.to_thread(db_add_group, chat_id, update.effective_chat.title)
 
-    cursor.execute("SELECT msg_limit, current_count FROM group_settings WHERE chat_id = %s", (chat_id,))
-    res = cursor.fetchone()
+    if user:
+        await asyncio.to_thread(db_add_or_update_user, user.id, user.first_name)
+        await asyncio.to_thread(db_add_group_user, chat_id, user.id)
 
-    if not res:
-        # Default Limit 20 ထားရှိမည်
-        cursor.execute("INSERT INTO group_settings (chat_id, msg_limit, current_count) VALUES (%s, 20, 1)", (chat_id,))
-        conn.commit()
-        cursor.close()
-        conn.close()
+    if update.message and update.message.text and update.message.text.startswith('/'):
         return
 
-    msg_limit, current_count = res
-    new_count = current_count + 1
-
-    if new_count >= msg_limit:
-        # Counter ကို Reset ပြန်လုပ်မည်
-        cursor.execute("UPDATE group_settings SET current_count = 0 WHERE chat_id = %s", (chat_id,))
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-        # Group အတွက် Random Post ဆွဲယူမည်
-        post_id = get_random_group_post_id(chat_id)
-        if post_id:
-            text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id=0, is_group=True)
-            if post_type == "photo":
-                await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-            elif post_type == "video":
-                await context.bot.send_video(chat_id=chat_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        cursor.execute("UPDATE group_settings SET current_count = %s WHERE chat_id = %s", (new_count, chat_id))
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-
-# --- Callbacks ---
-
-async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Reaction ပေးရန် Channel ကို အရင် Join ထားရပါမည်!", show_alert=True)
+    if chat_id in active_games:
         return
 
-    await query.answer()
+    group_counters[chat_id] = group_counters.get(chat_id, 0) + 1
+    current_count = group_counters[chat_id]
 
-    data = query.data.split("_")
-    post_id = int(data[1])
-    selected_rec = data[2]
-    is_group = (data[3] == "grp")
+    threshold = CACHE_SETTINGS.get("threshold", 6)
+    if current_count >= threshold:
+        group_counters[chat_id] = 0
+        asyncio.create_task(start_game(chat_id, context))
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO reactions (post_id, user_id, reaction) VALUES (%s, %s, %s)
-        ON CONFLICT (post_id, user_id) DO UPDATE SET reaction = EXCLUDED.reaction
-    """, (post_id, user_id, selected_rec))
-    conn.commit()
-    cursor.close()
-    conn.close()
+# UI Text Generator
+def generate_game_text(game):
+    t1 = TEAMS[game['team1']]
+    t2 = TEAMS[game['team2']]
 
-    text, reply_markup, _ = render_post_ui(post_id, user_id, is_profile=False, is_group=is_group)
+    list_t1 = [get_mention(uid, b['name']) for uid, b in game['bets'].items() if b['choice'] == '1']
+    list_draw = [get_mention(uid, b['name']) for uid, b in game['bets'].items() if b['choice'] == 'draw']
+    list_t2 = [get_mention(uid, b['name']) for uid, b in game['bets'].items() if b['choice'] == '2']
+
+    text = (
+        f"⚽  <b>𝗖𝗵𝗼𝗼𝘀𝗲 𝗙𝗼𝗿 𝗪𝗶𝗻 🍀</b>\n\n"
+        f"🏖️ {t1['emoji']} <b>{game['team1']}</b> 𝚟𝚜 <b>{game['team2']}</b> {t2['emoji']} ⛵\n\n"
+        f"⛲ 𝘚𝘵𝘢𝘥𝘪𝘶𝘮 - {t1['stadium']}\n"
+        f"⏲ 𝘛𝘪𝘮𝘦 𝘓𝘦𝘧𝘵 - <code>{game['time_left']}</code>s\n\n"
+        f"🧩 𝙇𝙞𝙫𝙚 𝘽𝙚𝙩𝙩𝙞𝙣𝙜 𝙇𝙞𝙨𝙩\n\n"
+        f"♠️ <b>{game['team1']}:</b> {', '.join(list_t1) if list_t1 else '-'}\n"
+        f"♦️ <b>Draw:</b> {', '.join(list_draw) if list_draw else '-'}\n"
+        f"♥ <b>{game['team2']}:</b> {', '.join(list_t2) if list_t2 else '-'}\n\n"
+        f"GᴏᴏᴅLᴜᴄᴋ G_ʏ ☘️"
+    )
+    return text
+
+# Start Game
+async def start_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await query.edit_message_reply_markup(reply_markup=reply_markup)
+        team1_name, team2_name = random.sample(list(TEAMS.keys()), 2)
+        team1 = TEAMS[team1_name]
+        team2 = TEAMS[team2_name]
+
+        game_data = {
+            "team1": team1_name,
+            "team2": team2_name,
+            "bets": {},
+            "time_left": 60
+        }
+        active_games[chat_id] = game_data
+
+        keyboard = [
+            [
+                InlineKeyboardButton(f"{team1['emoji']} {team1_name}", callback_data="bet_1"),
+                InlineKeyboardButton(f"{team2['emoji']} {team2_name}", callback_data="bet_2")
+            ],
+            [
+                InlineKeyboardButton("🤝 Draw", callback_data="bet_draw")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = generate_game_text(game_data)
+
+        val, media_type = await asyncio.to_thread(db_get_setting, "game_media")
+        game_media = {"type": media_type, "file_id": val} if val else {"type": None, "file_id": None}
+
+        if game_media["type"] == "photo":
+            sent_msg = await context.bot.send_photo(chat_id=chat_id, photo=game_media["file_id"], caption=text, parse_mode="HTML", reply_markup=reply_markup)
+        elif game_media["type"] == "video":
+            sent_msg = await context.bot.send_video(chat_id=chat_id, video=game_media["file_id"], caption=text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            sent_msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+
+        game_data["message_id"] = sent_msg.message_id
+
+        # Countdown Loop
+        for _ in range(12):
+            await asyncio.sleep(5)
+            if chat_id not in active_games:
+                return
+            game_data["time_left"] -= 5
+            try:
+                if game_media["type"]:
+                    await context.bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=game_data["message_id"],
+                        caption=generate_game_text(game_data),
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=game_data["message_id"],
+                        text=generate_game_text(game_data),
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+            except BadRequest:
+                pass
+            except Exception as e:
+                logger.error(f"Error updating game countdown: {e}")
+
+        await resolve_game(chat_id, context)
+
+    except Exception as e:
+        logger.error(f"Error in start_game: {e}")
+        active_games.pop(chat_id, None)
+
+# Button Handler
+async def handle_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    user = query.from_user
+
+    if chat_id not in active_games:
+        await query.answer("❌ ဒီပွဲစဉ်အတွက် အချိန်ကုန်သွားပါပြီ။", show_alert=True)
+        return
+
+    choice = query.data.replace("bet_", "")
+    game = active_games[chat_id]
+
+    await asyncio.to_thread(db_add_or_update_user, user.id, user.first_name)
+    game["bets"][user.id] = {
+        "name": user.first_name,
+        "choice": choice
+    }
+
+    choice_name = game['team1'] if choice == '1' else (game['team2'] if choice == '2' else "Draw")
+    await query.answer(f"✅ သင်သည် {choice_name} ကို ရွေးချယ်လိုက်ပါပြီ။")
+
+# Game Result
+async def resolve_game(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    game = active_games.pop(chat_id, None)
+    if not game:
+        return
+
+    msg_id = game.get("message_id")
+
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except Exception:
         pass
 
+    try:
+        anim_msg = await context.bot.send_dice(chat_id=chat_id, emoji="⚡")
+        await asyncio.sleep(3)
+        await context.bot.delete_message(chat_id=chat_id, message_id=anim_msg.message_id)
+    except Exception:
+        pass
 
-# (အခြား Callback များ - handle_check_join, handle_feed_nav, handle_admin_delete_post, handle_view_my_posts, handle_profile_nav, handle_delete_post, handle_back_to_profile, handle_open_feed, handle_open_popular စသည်တို့ အဟောင်းအတိုင်းပါဝင်ပါသည်)
+    score1 = random.randint(0, 4)
+    score2 = random.randint(0, 4)
 
-async def handle_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if score1 > score2:
+        winning_choice = "1"
+        winner_name = game["team1"]
+    elif score2 > score1:
+        winning_choice = "2"
+        winner_name = game["team2"]
+    else:
+        winning_choice = "draw"
+        winner_name = "Draw"
+
+    winners = []
+    losers = []
+
+    for user_id, bet in game["bets"].items():
+        user_mt = get_mention(user_id, bet['name'])
+        if bet["choice"] == winning_choice:
+            reward = 30 if winning_choice == "draw" else 10
+            await asyncio.to_thread(db_add_coins, user_id, reward)
+            winners.append(f"{user_mt} (+{reward} 🩸Kachin Coin)")
+        else:
+            losers.append(f"{user_mt}")
+
+    t1 = TEAMS[game['team1']]
+    t2 = TEAMS[game['team2']]
+
+    result_text = (
+        f"🎗️  <b>𝗠𝗮𝘁𝗰𝗵 𝗥𝗲𝘀𝘂𝗹𝘁   🧶</b>\n\n"
+        f"🏖️ {t1['emoji']} <b>{game['team1']}</b> {score1} - {score2} <b>{game['team2']}</b> {t2['emoji']} 🪂\n\n"
+        f"⚡ 𝗪𝗶𝗻 - <b>{winner_name}</b>\n\n"
+        f"✨ <b>𝐖𝐢𝐧𝐧𝐞𝐫𝐬 -</b>\n" + ("\n".join([f"• {w}" for w in winners]) if winners else "• မရှိပါ") + "\n\n"
+        f"🐸 <b>𝐋𝐨𝐬𝐬𝐞𝐫𝐬 -</b>\n" + ("\n".join([f"• {l}" for l in losers]) if losers else "• မရှိပါ")
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🏆 Top In Gp", callback_data="top_gp"),
+            InlineKeyboardButton("🌐 Global Top", callback_data="top_global")
+        ],
+        [
+            InlineKeyboardButton("🏰 Top Groups", callback_data="top_groups")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    last_result_data[chat_id] = {
+        "text": result_text,
+        "markup": reply_markup
+    }
+
+    val, media_type = await asyncio.to_thread(db_get_setting, "result_media")
+    result_media = {"type": media_type, "file_id": val} if val else {"type": None, "file_id": None}
+
+    if result_media["type"] == "photo":
+        await context.bot.send_photo(chat_id=chat_id, photo=result_media["file_id"], caption=result_text, parse_mode="HTML", reply_markup=reply_markup)
+    elif result_media["type"] == "video":
+        await context.bot.send_video(chat_id=chat_id, video=result_media["file_id"], caption=result_text, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode="HTML", reply_markup=reply_markup)
+
+# /kc Command Check User Info
+async def check_kc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    await asyncio.to_thread(db_add_or_update_user, user_id, user.first_name)
+
+    info = await asyncio.to_thread(db_get_user_info, user_id)
+    coins = info[1] if info else 0
+    user_mt = get_mention(user_id, user.first_name)
+
+    def get_rank():
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users WHERE coins > %s", (coins,))
+            higher_rank_users = cursor.fetchone()[0]
+            cursor.close()
+            return higher_rank_users + 1
+
+    rank_num = await asyncio.to_thread(get_rank)
+    rank = f"#{rank_num}" if coins > 0 else "Unranked"
+
+    msg = (
+        f"💳 <b>KACHIN COIN INFO</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Name:</b> {user_mt}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+        f"🩸 <b>Kachin Coin:</b> <b>{coins}</b>\n"
+        f"🏆 <b>Global Rank:</b> <b>{rank}</b>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+# Leaderboard Callback Query Handler
+async def handle_leaderboards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    data = query.data
 
-    if await check_channel_member(context.bot, user_id):
-        await query.answer("✅ Channel Join ထားခြင်း အတည်ပြုပြီးပါပြီ!", show_alert=True)
+    back_button = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_result")]])
+
+    async def update_msg(text, markup):
         try:
-            await query.message.delete()
+            if query.message.photo or query.message.video:
+                await query.edit_message_caption(caption=text, parse_mode="HTML", reply_markup=markup)
+            else:
+                await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=markup)
         except Exception:
             pass
 
-        msg = (
-            f"မင်္ဂလာပါ {escape_markdown(query.from_user.first_name)} bro! 🚀\n\n"
-            "📌 **အသုံးပြုနည်းများ:**\n"
-            "• **Post တင်ရန်:** စာ/ပုံ/Video ကို Reply (rp) ထောက်ပြီး `/post` ဟု ရိုက်ပါ။\n"
-            "• `/feed` - Post များကို တလှည့်စီ ကြည့်ရန်/Reaction ပေးရန်\n"
-            "• `/profile` - မိမိ Profile Dashboard ကြည့်ရန်\n"
-            "• `/popular` - Popular Post များဆီ သွားရောက်ကြည့်ရှုရန်"
-        )
-        await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
-    else:
-        await query.answer("❌ Channel ကို Join မထားရသေးပါဘူး bro! ကျေးဇူးပြုပြီး မဖြစ်မနေ Join ပေးပါ။", show_alert=True)
+    if data == "top_gp":
+        def get_top_gp():
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT u.user_id, u.first_name, u.coins 
+                    FROM group_users gu 
+                    JOIN users u ON gu.user_id = u.user_id 
+                    WHERE gu.chat_id = %s AND u.coins > 0 
+                    ORDER BY u.coins DESC LIMIT 10
+                """, (chat_id,))
+                res = cursor.fetchall()
+                cursor.close()
+                return res
 
-async def handle_feed_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
-        return
-    await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
+        top10 = await asyncio.to_thread(get_top_gp)
 
-    post_id = get_random_post_id(user_id)
-    if not post_id:
-        await context.bot.send_message(chat_id=user_id, text="လောလောဆယ် Post များ မရှိသေးပါဘူး bro!")
-        return
+        text = "🏆 <b>TOP 10 IN GROUP</b>\n━━━━━━━━━━━━━━━━━━━\n"
+        if not top10:
+            text += "မရှိသေးပါ"
+        else:
+            for idx, (uid, name, c) in enumerate(top10, start=1):
+                text += f"{idx}. {get_mention(uid, name)} — <b>{c}</b> 🩸\n"
 
-    text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-    if post_type == "photo":
-        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    elif post_type == "video":
-        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update_msg(text, back_button)
 
-async def handle_admin_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if user_id != ADMIN_ID:
-        await query.answer("❌ ဒီ ခလုတ်ကို Admin သီးသန့်သာ အသုံးပြုခွင့်ရှိပါတယ် bro!", show_alert=True)
-        return
-    post_id = int(query.data.split("_")[2])
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM posts WHERE post_id = %s", (post_id,))
-    cursor.execute("DELETE FROM reactions WHERE post_id = %s", (post_id,))
-    cursor.execute("DELETE FROM post_views WHERE post_id = %s", (post_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    await query.answer("🗑 Post ကို အောင်မြင်စွာ ဖျက်လိုက်ပါပြီ Admin!", show_alert=True)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
+    elif data == "top_global":
+        def get_top_global():
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, first_name, coins FROM users WHERE coins > 0 ORDER BY coins DESC LIMIT 10")
+                res = cursor.fetchall()
+                cursor.close()
+                return res
 
-async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
-        return
-    await query.answer()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT post_id FROM posts WHERE user_id = %s ORDER BY post_id DESC", (user_id,))
-    user_posts = cursor.fetchall()
-    cursor.close()
-    conn.close()
+        global_scores = await asyncio.to_thread(get_top_global)
 
-    if not user_posts:
-        await query.answer("Bro တင်ထားတဲ့ Post မရှိပါဘူး!", show_alert=True)
-        return
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    post_id = user_posts[0][0]
-    text, reply_markup, (post_type, file_id) = render_post_ui(
-        post_id, user_id, is_profile=True, current_index=0, total_posts=len(user_posts)
-    )
-    if post_type == "photo":
-        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    elif post_type == "video":
-        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+        text = "🌐 <b>GLOBAL TOP 10 PLAYERS</b>\n━━━━━━━━━━━━━━━━━━━\n"
+        if not global_scores:
+            text += "မရှိသေးပါ"
+        else:
+            for idx, (uid, name, c) in enumerate(global_scores, start=1):
+                text += f"{idx}. {get_mention(uid, name)} — <b>{c}</b> 🩸\n"
 
-async def handle_profile_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
-        return
-    await query.answer()
-    target_index = int(query.data.split("_")[1])
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT post_id FROM posts WHERE user_id = %s ORDER BY post_id DESC", (user_id,))
-    user_posts = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    if not user_posts or target_index < 0 or target_index >= len(user_posts):
-        return
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    post_id = user_posts[target_index][0]
-    text, reply_markup, (post_type, file_id) = render_post_ui(
-        post_id, user_id, is_profile=True, current_index=target_index, total_posts=len(user_posts)
-    )
-    if post_type == "photo":
-        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    elif post_type == "video":
-        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update_msg(text, back_button)
 
-async def handle_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    data = query.data.split("_")
-    post_id = int(data[2])
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM posts WHERE post_id = %s AND user_id = %s", (post_id, user_id))
-    cursor.execute("DELETE FROM reactions WHERE post_id = %s", (post_id,))
-    cursor.execute("DELETE FROM post_views WHERE post_id = %s", (post_id,))
-    conn.commit()
-    await query.answer("🗑 Post ကို အောင်မြင်စွာ ဖျက်လိုက်ပါပြီ!", show_alert=True)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    profile_text, reply_markup = get_profile_dashboard(query.from_user)
-    await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif data == "top_groups":
+        def get_top_groups():
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT g.chat_id, g.title, SUM(u.coins) as total_coins 
+                    FROM group_users gu 
+                    JOIN groups g ON gu.chat_id = g.chat_id 
+                    JOIN users u ON gu.user_id = u.user_id 
+                    GROUP BY g.chat_id, g.title 
+                    HAVING SUM(u.coins) > 0 
+                    ORDER BY total_coins DESC LIMIT 10
+                """)
+                res = cursor.fetchall()
+                cursor.close()
+                return res
 
-async def handle_back_to_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    profile_text, reply_markup = get_profile_dashboard(user)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    await context.bot.send_message(chat_id=user.id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
+        sorted_gps = await asyncio.to_thread(get_top_groups)
 
-async def handle_open_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
-        return
-    await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    post_id = get_random_post_id(user_id)
-    if not post_id:
-        await context.bot.send_message(chat_id=user_id, text="လောလောဆယ် Post မရှိသေးပါဘူး bro!")
-        return
-    text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-    if post_type == "photo":
-        await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    elif post_type == "video":
-        await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+        text = "🏰 <b>The Group with the Highest Total Kachi Coin</b>\n━━━━━━━━━━━━━━━━━━━\n"
+        if not sorted_gps:
+            text += "မရှိသေးပါ"
+        else:
+            for idx, (g_id, g_title, tot) in enumerate(sorted_gps, start=1):
+                text += f"{idx}. <b>{html.escape(g_title if g_title else f'Group {g_id}')}</b> — <b>{tot}</b> 🩸\n"
 
-async def handle_open_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
-        return
-    await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    msg, keyboard = get_popular_data(context.bot.username)
-    await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
+        await update_msg(text, back_button)
 
+    elif data == "back_to_result":
+        orig_data = last_result_data.get(chat_id)
+        if orig_data:
+            await update_msg(orig_data["text"], orig_data["markup"])
+        else:
+            await query.answer("မရရှိနိုင်တော့ပါ။", show_alert=True)
 
-# --- Main ---
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("c", set_counter))
+    app.add_handler(CommandHandler("kc", check_kc))
+    app.add_handler(CommandHandler("bal", check_kc))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+
+    # Photo / Video Commands for Admin
+    app.add_handler(CommandHandler("g", media_control))
+    app.add_handler(CommandHandler("r", media_control))
+
+    app.add_handler(CallbackQueryHandler(handle_bet, pattern="^bet_"))
+    app.add_handler(CallbackQueryHandler(handle_leaderboards, pattern="^(top_gp|top_global|top_groups|back_to_result)$"))
+
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_messages))
+
+    print("=== Bot is running cleanly with PostgreSQL Connection Pool ===")
+    app.run_polling(drop_pending_updates=True)
+
 if __name__ == "__main__":
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("post", create_post))
-    app.add_handler(CommandHandler("feed", show_feed))
-    app.add_handler(CommandHandler("profile", show_profile))
-    app.add_handler(CommandHandler("popular", show_popular))
-
-    # Admin Group Command
-    app.add_handler(CommandHandler("add", set_group_limit))
-
-    # Group Text Message Listener
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), track_group_messages))
-
-    # Inline Callbacks
-    app.add_handler(CallbackQueryHandler(handle_check_join, pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(handle_reaction, pattern="^rec_"))
-    app.add_handler(CallbackQueryHandler(handle_feed_nav, pattern="^feednav_"))
-    app.add_handler(CallbackQueryHandler(handle_admin_delete_post, pattern="^admin_dele_"))
-    app.add_handler(CallbackQueryHandler(handle_view_my_posts, pattern="^view_my_posts$"))
-    app.add_handler(CallbackQueryHandler(handle_profile_nav, pattern="^profnav_"))
-    app.add_handler(CallbackQueryHandler(handle_delete_post, pattern="^delete_post_"))
-    app.add_handler(CallbackQueryHandler(handle_back_to_profile, pattern="^back_to_profile$"))
-    app.add_handler(CallbackQueryHandler(handle_back_to_profile, pattern="^open_my_profile$"))
-    app.add_handler(CallbackQueryHandler(handle_open_feed, pattern="^open_feed$"))
-    app.add_handler(CallbackQueryHandler(handle_open_popular, pattern="^open_popular$"))
-
-    print("FB Advanced Group-Supported Bot စတင်ပွင့်လှစ်နေပါပြီ...")
-    app.run_polling()
+    main()
