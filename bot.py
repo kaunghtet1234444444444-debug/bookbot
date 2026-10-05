@@ -181,7 +181,7 @@ def get_random_post_id(user_id: int):
     return any_post[0] if any_post else None
 
 
-# Helper: Random Post ID (Group များအတွက်)
+# Helper: Random Post ID (Group များအတွက် - Fixed Logic)
 def get_random_group_post_id(chat_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -210,10 +210,13 @@ def get_random_group_post_id(chat_id: int):
     if any_post:
         cursor.execute("INSERT INTO group_post_history (chat_id, post_id) VALUES (%s, %s)", (chat_id, any_post[0]))
         conn.commit()
+        cursor.close()
+        conn.close()
+        return any_post[0]
 
     cursor.close()
     conn.close()
-    return any_post[0] if any_post else None
+    return None
 
 
 # Helper: Post UI Render (DM နှင့် Group ခွဲခြားထားပါသည်)
@@ -1034,8 +1037,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("add", set_group_limit))
     app.add_handler(CommandHandler("grouplist", show_group_list))
 
-    # Group Text Message Listener
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), track_group_messages))
+    # Group Message Listener (Fixed: စာ၊ ပုံ၊ ဗီဒီယို မက်ဆေ့ခ်ျအားလုံးအတွက် အလုပ်လုပ်အောင် ပြောင်းလဲထားပါသည်)
+    app.add_handler(MessageHandler((~filters.COMMAND) & (filters.ChatType.GROUPS), track_group_messages))
 
     # Inline Callbacks
     app.add_handler(CallbackQueryHandler(handle_check_join, pattern="^check_join$"))
