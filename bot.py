@@ -3,12 +3,14 @@ import os
 import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 from telegram.error import BadRequest
 
@@ -23,7 +25,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "7940553702"))
 CHANNEL_USERNAME = "@TeleFeedBookChannel"  # Channel Username
 CHANNEL_LINK = "https://t.me/TeleFeedBookChannel"
 
-# DATABASE CONNECTION (PostgreSQL Support for Railways)
+# DATABASE CONNECTION (PostgreSQL Support for Railway)
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection():
@@ -70,12 +72,29 @@ def init_db():
     );
     """)
 
-    # ကြည့်ပြီးသား ပို့စ်များ မှတ်ရန် Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS post_views (
         user_id BIGINT,
         post_id INT,
         PRIMARY KEY (user_id, post_id)
+    );
+    """)
+
+    # Group Settings Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS group_settings (
+        chat_id BIGINT PRIMARY KEY,
+        msg_limit INT DEFAULT 20,
+        current_count INT DEFAULT 0
+    );
+    """)
+
+    # Group များတွင် ကျပြီးသား Post များ မှတ်ရန် Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS group_post_history (
+        chat_id BIGINT,
+        post_id INT,
+        PRIMARY KEY (chat_id, post_id)
     );
     """)
 
@@ -114,12 +133,11 @@ def get_force_join_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-# Helper: Random Unseen/Seen Post ID ဆွဲထုတ်ပေးမည့် Function
+# Helper: Random Unseen Post ID (User DM အတွက်)
 def get_random_post_id(user_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # ၁။ မကြည့်ရသေးသော ပို့စ်များကို Random ရှာပါ
     cursor.execute("""
         SELECT post_id FROM posts 
         WHERE post_id NOT IN (SELECT post_id FROM post_views WHERE user_id = %s)
@@ -132,7 +150,6 @@ def get_random_post_id(user_id: int):
         conn.close()
         return unseen_post[0]
 
-    # ၂။ အကယ်၍ မကြည့်ရသေးသည်များ မရှိတော့ပါက ကြည့်ပြီးသားများထဲမှ Random ပြပါ
     cursor.execute("SELECT post_id FROM posts ORDER BY RANDOM() LIMIT 1")
     any_post = cursor.fetchone()
     cursor.close()
@@ -141,8 +158,43 @@ def get_random_post_id(user_id: int):
     return any_post[0] if any_post else None
 
 
-# Helper: Post UI Render လုပ်ပေးသည့် Function
-def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current_index: int = 0, total_posts: int = 0):
+# Helper: Random Post ID (Group များအတွက် - မကျဖူးသေးတာ အရင်ရွေးမည်)
+def get_random_group_post_id(chat_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT post_id FROM posts 
+        WHERE post_id NOT IN (SELECT post_id FROM group_post_history WHERE chat_id = %s)
+        ORDER BY RANDOM() LIMIT 1
+    """, (chat_id,))
+    unseen_post = cursor.fetchone()
+
+    if unseen_post:
+        post_id = unseen_post[0]
+        cursor.execute("INSERT INTO group_post_history (chat_id, post_id) VALUES (%s, %s)", (chat_id, post_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return post_id
+
+    # အကုန်ကျဖူးသွားရင် History ရှင်းပြီး Random ပြန်စမည်
+    cursor.execute("DELETE FROM group_post_history WHERE chat_id = %s", (chat_id,))
+    conn.commit()
+
+    cursor.execute("SELECT post_id FROM posts ORDER BY RANDOM() LIMIT 1")
+    any_post = cursor.fetchone()
+    if any_post:
+        cursor.execute("INSERT INTO group_post_history (chat_id, post_id) VALUES (%s, %s)", (chat_id, any_post[0]))
+        conn.commit()
+
+    cursor.close()
+    conn.close()
+    return any_post[0] if any_post else None
+
+
+# Helper: Post UI Render (DM နှင့် Group ခွဲခြားထားပါသည်)
+def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current_index: int = 0, total_posts: int = 0, is_group: bool = False):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -155,14 +207,13 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
 
     author_id, post_type, file_id, caption = post
 
-    # User ကြည့်ပြီးကြောင်း DB ထဲ မှတ်တမ်းတင်ပါ
-    cursor.execute("""
-        INSERT INTO post_views (user_id, post_id) VALUES (%s, %s)
-        ON CONFLICT (user_id, post_id) DO NOTHING
-    """, (user_id, post_id))
-    conn.commit()
+    if not is_group:
+        cursor.execute("""
+            INSERT INTO post_views (user_id, post_id) VALUES (%s, %s)
+            ON CONFLICT (user_id, post_id) DO NOTHING
+        """, (user_id, post_id))
+        conn.commit()
 
-    # Author Name with Mention Link
     cursor.execute("SELECT username FROM users WHERE user_id = %s", (author_id,))
     author = cursor.fetchone()
     raw_author_name = author[0] if author else "Unknown"
@@ -183,36 +234,37 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
         counts[r] = cursor.fetchone()[0]
 
     rec_buttons = [
-        InlineKeyboardButton(f"{r} {counts[r]}", callback_data=f"rec_{post_id}_{r}_{'prof' if is_profile else 'feed'}_{current_index}")
+        InlineKeyboardButton(f"{r} {counts[r]}", callback_data=f"rec_{post_id}_{r}_{'grp' if is_group else 'dm'}")
         for r in reactions_list
     ]
 
-    nav_buttons = []
-    if is_profile:
-        if current_index > 0:
-            nav_buttons.append(InlineKeyboardButton("◀️ Back", callback_data=f"profnav_{current_index - 1}"))
-        if current_index < total_posts - 1:
-            nav_buttons.append(InlineKeyboardButton("▶ Next", callback_data=f"profnav_{current_index + 1}"))
-    else:
-        # Feed မှာ Random ပို့စ်အသစ် ရယူနိုင်မည့် Next ခလုတ်
-        nav_buttons.append(InlineKeyboardButton("▶ Next Post", callback_data=f"feednav_{post_id}_next"))
-
     keyboard = [rec_buttons]
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-        
-    if is_profile:
-        keyboard.append([InlineKeyboardButton("🗑 Delete This Post", callback_data=f"delete_post_{post_id}_{current_index}")])
-        keyboard.append([InlineKeyboardButton("⬅ Back to Profile", callback_data="back_to_profile")])
-    else:
-        keyboard.append([
-            InlineKeyboardButton("🔥 Popular Posts", callback_data="open_popular"),
-            InlineKeyboardButton("👤 မိမိ Profile", callback_data="open_my_profile")
-        ])
-        
-        # Admin သီးသန့် Dele Button ထည့်သွင်းခြင်း
-        if user_id == ADMIN_ID:
-            keyboard.append([InlineKeyboardButton("🗑 Dele (Admin Only)", callback_data=f"admin_dele_{post_id}")])
+
+    # Group မဟုတ်မှသာ Next, Profile, Popular ခလုတ်များ ထည့်မည်
+    if not is_group:
+        nav_buttons = []
+        if is_profile:
+            if current_index > 0:
+                nav_buttons.append(InlineKeyboardButton("◀️ Back", callback_data=f"profnav_{current_index - 1}"))
+            if current_index < total_posts - 1:
+                nav_buttons.append(InlineKeyboardButton("▶ Next", callback_data=f"profnav_{current_index + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("▶ Next Post", callback_data=f"feednav_{post_id}_next"))
+
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+            
+        if is_profile:
+            keyboard.append([InlineKeyboardButton("🗑 Delete This Post", callback_data=f"delete_post_{post_id}_{current_index}")])
+            keyboard.append([InlineKeyboardButton("⬅ Back to Profile", callback_data="back_to_profile")])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("🔥 Popular Posts", callback_data="open_popular"),
+                InlineKeyboardButton("👤 မိမိ Profile", callback_data="open_my_profile")
+            ])
+            
+            if user_id == ADMIN_ID:
+                keyboard.append([InlineKeyboardButton("🗑 Dele (Admin Only)", callback_data=f"admin_dele_{post_id}")])
 
     cursor.close()
     conn.close()
@@ -296,6 +348,10 @@ def get_popular_data(bot_username: str):
 # --- Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Group ထဲတွင် /start ခေါ်ပါက မည်သည့်အရာမှ ပြန်မလုပ်ပါ
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
     user = update.effective_user
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -342,10 +398,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/profile` - မိမိ Profile Dashboard ကြည့်ရန်\n"
         "• `/popular` - Popular Post များဆီ သွားရောက်ကြည့်ရှုရန်"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
+    
+    # Add to Group Button ထည့်သွင်းခြင်း
+    bot_username = context.bot.username
+    add_group_url = f"https://t.me/{bot_username}?startgroup=true"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add to Group", url=add_group_url)]
+    ])
+
+    await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
 
 
 async def create_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
     user_id = update.effective_user.id
 
     if not await check_channel_member(context.bot, user_id):
@@ -393,6 +460,9 @@ async def create_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
     user_id = update.effective_user.id
 
     if not await check_channel_member(context.bot, user_id):
@@ -416,10 +486,13 @@ async def show_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
     user = update.effective_user
 
     if not await check_channel_member(context.bot, user.id):
-        await update.message.reply_text("⚠️️ Profile ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
+        await update.message.reply_text("⚠ Profile ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
         return
 
     profile_text, reply_markup = get_profile_dashboard(user)
@@ -427,6 +500,9 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+
     if not await check_channel_member(context.bot, update.effective_user.id):
         await update.message.reply_text("⚠️ Popular Posts ကြည့်ရန် အောက်ပါ Channel ကို အရင် Join ပေးပါ bro!", reply_markup=get_force_join_keyboard(), reply_to_message_id=update.message.message_id)
         return
@@ -435,80 +511,120 @@ async def show_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
 
 
-# --- Admin Commands ---
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Admin Command: /add ---
+async def set_group_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         return
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM posts")
-    total_posts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM reactions")
-    total_reactions = cursor.fetchone()[0]
-
-    cursor.close()
-    conn.close()
-
-    stats_msg = (
-        "📊 **Bot Statistics (Admin Only)**\n\n"
-        f"👥 စုစုပေါင်း Users: `{total_users}`\n"
-        f"📝 စုစုပေါင်း Posts: `{total_posts}`\n"
-        f"❤️ စုစုပေါင်း Reactions: `{total_reactions}`"
-    )
-    await update.message.reply_text(stats_msg, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-
-
-async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("❌ ဒီ Command ကို Group ထဲမှာပဲ သုံးလို့ရပါတယ် bro!")
         return
 
-    reply_msg = update.message.reply_to_message
-    if not reply_msg:
-        await update.message.reply_text("❌ ကျေးဇူးပြုပြီး Broadcast ပို့ချင်သည့် စာ/ပုံ/Video ကို Reply (rp) ထောက်ပြီး `/broadcast` လို့ ရိုက်ပါ bro!", reply_to_message_id=update.message.message_id)
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ ကျေးဇူးပြုပြီး ဂဏန်းထည့်ပေးပါ။ ဥပမာ - `/add 20`", parse_mode="Markdown")
         return
+
+    limit = int(context.args[0])
+    chat_id = update.effective_chat.id
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
+    cursor.execute("""
+        INSERT INTO group_settings (chat_id, msg_limit, current_count) 
+        VALUES (%s, %s, 0)
+        ON CONFLICT (chat_id) DO UPDATE SET msg_limit = EXCLUDED.msg_limit
+    """, (chat_id, limit))
+    conn.commit()
     cursor.close()
     conn.close()
 
-    success = 0
-    failed = 0
+    await update.message.reply_text(f"✅ ဒီ Group အတွက် Message `{limit}` ကြောင်း ပြည့်တိုင်း Post တစ်ခု အလိုအလျောက် ကျလာပါမည် bro!", parse_mode="Markdown")
 
-    status_msg = await update.message.reply_text("📢 Broadcast စတင် ပို့ဆောင်နေပါပြီ...", reply_to_message_id=update.message.message_id)
 
-    for u in users:
-        target_id = u[0]
-        try:
-            await context.bot.copy_message(
-                chat_id=target_id,
-                from_chat_id=update.effective_chat.id,
-                message_id=reply_msg.message_id
-            )
-            success += 1
-        except Exception:
-            failed += 1
+# --- Group Message Listener & Random Post Sender ---
+async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in ["group", "supergroup"]:
+        return
 
-    await status_msg.edit_text(
-        f"✅ **Broadcast ပို့ဆောင်မှု ပြီးစီးပါပြီ!**\n\n"
-        f"🎯 အောင်မြင်စွာ ပို့ပြီး: `{success}`\n"
-        f"❌ မပို့နိုင်ခဲ့ပါ (Block/Blocked): `{failed}`",
-        parse_mode="Markdown"
-    )
+    chat_id = chat.id
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT msg_limit, current_count FROM group_settings WHERE chat_id = %s", (chat_id,))
+    res = cursor.fetchone()
+
+    if not res:
+        # Default Limit 20 ထားရှိမည်
+        cursor.execute("INSERT INTO group_settings (chat_id, msg_limit, current_count) VALUES (%s, 20, 1)", (chat_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return
+
+    msg_limit, current_count = res
+    new_count = current_count + 1
+
+    if new_count >= msg_limit:
+        # Counter ကို Reset ပြန်လုပ်မည်
+        cursor.execute("UPDATE group_settings SET current_count = 0 WHERE chat_id = %s", (chat_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        # Group အတွက် Random Post ဆွဲယူမည်
+        post_id = get_random_group_post_id(chat_id)
+        if post_id:
+            text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id=0, is_group=True)
+            if post_type == "photo":
+                await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+            elif post_type == "video":
+                await context.bot.send_video(chat_id=chat_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        cursor.execute("UPDATE group_settings SET current_count = %s WHERE chat_id = %s", (new_count, chat_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
 
 
 # --- Callbacks ---
+
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not await check_channel_member(context.bot, user_id):
+        await query.answer("⚠️ Reaction ပေးရန် Channel ကို အရင် Join ထားရပါမည်!", show_alert=True)
+        return
+
+    await query.answer()
+
+    data = query.data.split("_")
+    post_id = int(data[1])
+    selected_rec = data[2]
+    is_group = (data[3] == "grp")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO reactions (post_id, user_id, reaction) VALUES (%s, %s, %s)
+        ON CONFLICT (post_id, user_id) DO UPDATE SET reaction = EXCLUDED.reaction
+    """, (post_id, user_id, selected_rec))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    text, reply_markup, _ = render_post_ui(post_id, user_id, is_profile=False, is_group=is_group)
+    try:
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except Exception:
+        pass
+
+
+# (အခြား Callback များ - handle_check_join, handle_feed_nav, handle_admin_delete_post, handle_view_my_posts, handle_profile_nav, handle_delete_post, handle_back_to_profile, handle_open_feed, handle_open_popular စသည်တို့ အဟောင်းအတိုင်းပါဝင်ပါသည်)
 
 async def handle_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -533,65 +649,24 @@ async def handle_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.answer("❌ Channel ကို Join မထားရသေးပါဘူး bro! ကျေးဇူးပြုပြီး မဖြစ်မနေ Join ပေးပါ။", show_alert=True)
 
-
-async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠ Reaction ပေးရန် Channel ကို အရင် Join ထားရပါမည်!", show_alert=True)
-        return
-
-    await query.answer()
-
-    data = query.data.split("_")
-    post_id = int(data[1])
-    selected_rec = data[2]
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO reactions (post_id, user_id, reaction) VALUES (%s, %s, %s)
-        ON CONFLICT (post_id, user_id) DO UPDATE SET reaction = EXCLUDED.reaction
-    """, (post_id, user_id, selected_rec))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    # Reaction ပေးပြီးရင် Inline Keyboard ကို သာမန်အတိုင်း Update ပြုလုပ်ပေးသည်
-    text, reply_markup, _ = render_post_ui(post_id, user_id, is_profile=False)
-    try:
-        await query.edit_message_reply_markup(reply_markup=reply_markup)
-    except Exception:
-        pass
-
-
 async def handle_feed_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
     if not await check_channel_member(context.bot, user_id):
         await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
-
     await query.answer()
-
-    # စာဟောင်း/ပုံဟောင်းကို ဖျက်လိုက်မည်
     try:
         await query.message.delete()
     except Exception:
         pass
 
-    # Random Post ID အသစ်တစ်ခု ဆွဲယူမည်
     post_id = get_random_post_id(user_id)
-
     if not post_id:
         await context.bot.send_message(chat_id=user_id, text="လောလောဆယ် Post များ မရှိသေးပါဘူး bro!")
         return
 
     text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-
-    # Post အသစ်ကို အောက်သို့ ပို့ပေးမည်
     if post_type == "photo":
         await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
     elif post_type == "video":
@@ -599,18 +674,13 @@ async def handle_feed_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
-
 async def handle_admin_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
-    # Admin ဟုတ်မဟုတ် စစ်ဆေးခြင်း
     if user_id != ADMIN_ID:
         await query.answer("❌ ဒီ ခလုတ်ကို Admin သီးသန့်သာ အသုံးပြုခွင့်ရှိပါတယ် bro!", show_alert=True)
         return
-
     post_id = int(query.data.split("_")[2])
-
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM posts WHERE post_id = %s", (post_id,))
@@ -619,36 +689,19 @@ async def handle_admin_delete_post(update: Update, context: ContextTypes.DEFAULT
     conn.commit()
     cursor.close()
     conn.close()
-
     await query.answer("🗑 Post ကို အောင်မြင်စွာ ဖျက်လိုက်ပါပြီ Admin!", show_alert=True)
-
-    # Message ကို ဖျက်ပြီး Next Post သို့ ဆက်သွားပေးမည်
     try:
         await query.message.delete()
     except Exception:
         pass
 
-    next_post_id = get_random_post_id(user_id)
-    if next_post_id:
-        text, reply_markup, (post_type, file_id) = render_post_ui(next_post_id, user_id, is_profile=False)
-        if post_type == "photo":
-            await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-        elif post_type == "video":
-            await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
-        else:
-            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
-
-
 async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
     if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
+        await query.answer("⚠️️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
-
     await query.answer()
-
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT post_id FROM posts WHERE user_id = %s ORDER BY post_id DESC", (user_id,))
@@ -659,17 +712,14 @@ async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user_posts:
         await query.answer("Bro တင်ထားတဲ့ Post မရှိပါဘူး!", show_alert=True)
         return
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     post_id = user_posts[0][0]
     text, reply_markup, (post_type, file_id) = render_post_ui(
         post_id, user_id, is_profile=True, current_index=0, total_posts=len(user_posts)
     )
-    
     if post_type == "photo":
         await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
     elif post_type == "video":
@@ -677,111 +727,83 @@ async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
-
 async def handle_profile_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
     if not await check_channel_member(context.bot, user_id):
         await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
-
     await query.answer()
-
     target_index = int(query.data.split("_")[1])
-
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT post_id FROM posts WHERE user_id = %s ORDER BY post_id DESC", (user_id,))
     user_posts = cursor.fetchall()
     cursor.close()
     conn.close()
-
     if not user_posts or target_index < 0 or target_index >= len(user_posts):
         return
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     post_id = user_posts[target_index][0]
     text, reply_markup, (post_type, file_id) = render_post_ui(
         post_id, user_id, is_profile=True, current_index=target_index, total_posts=len(user_posts)
     )
-
     if post_type == "photo":
         await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
     elif post_type == "video":
         await context.bot.send_video(chat_id=user_id, video=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
-
 
 async def handle_delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
     data = query.data.split("_")
     post_id = int(data[2])
-
     conn = get_db_connection()
     cursor = conn.cursor()
-
     cursor.execute("DELETE FROM posts WHERE post_id = %s AND user_id = %s", (post_id, user_id))
     cursor.execute("DELETE FROM reactions WHERE post_id = %s", (post_id,))
     cursor.execute("DELETE FROM post_views WHERE post_id = %s", (post_id,))
     conn.commit()
-
     await query.answer("🗑 Post ကို အောင်မြင်စွာ ဖျက်လိုက်ပါပြီ!", show_alert=True)
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     profile_text, reply_markup = get_profile_dashboard(query.from_user)
     await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
-
 
 async def handle_back_to_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user = query.from_user
     profile_text, reply_markup = get_profile_dashboard(user)
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     await context.bot.send_message(chat_id=user.id, text=profile_text, reply_markup=reply_markup, parse_mode="Markdown")
-
 
 async def handle_open_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
     if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠️️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
+        await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
-
     await query.answer()
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     post_id = get_random_post_id(user_id)
-
     if not post_id:
         await context.bot.send_message(chat_id=user_id, text="လောလောဆယ် Post မရှိသေးပါဘူး bro!")
         return
-
     text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id, is_profile=False)
-
     if post_type == "photo":
         await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
     elif post_type == "video":
@@ -789,22 +811,17 @@ async def handle_open_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
 
-
 async def handle_open_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
     if not await check_channel_member(context.bot, user_id):
         await query.answer("⚠️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
-
     await query.answer()
-
     try:
         await query.message.delete()
     except Exception:
         pass
-
     msg, keyboard = get_popular_data(context.bot.username)
     await context.bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -820,9 +837,11 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("profile", show_profile))
     app.add_handler(CommandHandler("popular", show_popular))
 
-    # Admin Commands
-    app.add_handler(CommandHandler("stats", admin_stats))
-    app.add_handler(CommandHandler("broadcast", admin_broadcast))
+    # Admin Group Command
+    app.add_handler(CommandHandler("add", set_group_limit))
+
+    # Group Text Message Listener
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), track_group_messages))
 
     # Inline Callbacks
     app.add_handler(CallbackQueryHandler(handle_check_join, pattern="^check_join$"))
@@ -837,5 +856,5 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_open_feed, pattern="^open_feed$"))
     app.add_handler(CallbackQueryHandler(handle_open_popular, pattern="^open_popular$"))
 
-    print("FB Advanced Telegram Bot (PostgreSQL Connected) စတင်ပွင့်လှစ်နေပါပြီ...")
+    print("FB Advanced Group-Supported Bot စတင်ပွင့်လှစ်နေပါပြီ...")
     app.run_polling()
