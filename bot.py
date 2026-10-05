@@ -80,28 +80,16 @@ def init_db():
     );
     """)
 
-    # Group Settings Table (Added group_title, added_by, group_username for list tracking)
+    # Group Settings Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS group_settings (
         chat_id BIGINT PRIMARY KEY,
-        group_title TEXT,
-        group_username TEXT,
-        added_by BIGINT,
         msg_limit INT DEFAULT 20,
         current_count INT DEFAULT 0
     );
     """)
 
-    # Global Config Table (For global default message limit)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS global_config (
-        key TEXT PRIMARY KEY,
-        value_int INT
-    );
-    """)
-    cursor.execute("INSERT INTO global_config (key, value_int) VALUES ('default_msg_limit', 20) ON CONFLICT (key) DO NOTHING;")
-
-    # Group Post History Table
+    # Group များတွင် ကျပြီးသား Post များ မှတ်ရန် Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS group_post_history (
         chat_id BIGINT,
@@ -116,17 +104,6 @@ def init_db():
 
 # Initialize Database
 init_db()
-
-
-# Helper: Get Global Default Message Limit
-def get_global_limit() -> int:
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value_int FROM global_config WHERE key = 'default_msg_limit'")
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row[0] if row else 20
 
 
 # Helper: Markdown Text Escape
@@ -181,7 +158,7 @@ def get_random_post_id(user_id: int):
     return any_post[0] if any_post else None
 
 
-# Helper: Random Post ID (Group များအတွက် - Fixed Logic)
+# Helper: Random Post ID (Group များအတွက် - မကျဖူးသေးတာ အရင်ရွေးမည်)
 def get_random_group_post_id(chat_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -210,17 +187,14 @@ def get_random_group_post_id(chat_id: int):
     if any_post:
         cursor.execute("INSERT INTO group_post_history (chat_id, post_id) VALUES (%s, %s)", (chat_id, any_post[0]))
         conn.commit()
-        cursor.close()
-        conn.close()
-        return any_post[0]
 
     cursor.close()
     conn.close()
-    return None
+    return any_post[0] if any_post else None
 
 
 # Helper: Post UI Render (DM နှင့် Group ခွဲခြားထားပါသည်)
-def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current_index: int = 0, total_posts: int = 0, is_group: bool = False, bot_username: str = ""):
+def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current_index: int = 0, total_posts: int = 0, is_group: bool = False):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -266,12 +240,7 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
 
     keyboard = [rec_buttons]
 
-    # Group ထဲတွင် ကျလာပါက Reaction Button အောက်၌ "✍️ Post တင်ရန်" Button ထည့်မည်
-    if is_group:
-        post_url = f"https://t.me/{bot_username}?start=post" if bot_username else CHANNEL_LINK
-        keyboard.append([InlineKeyboardButton("✍️ Post တင်ရန်", url=post_url)])
-
-    # DM မဟုတ်မှသာ Next, Profile, Popular ခလုတ်များ ထည့်မည်
+    # Group မဟုတ်မှသာ Next, Profile, Popular ခလုတ်များ ထည့်မည်
     if not is_group:
         nav_buttons = []
         if is_profile:
@@ -300,85 +269,6 @@ def render_post_ui(post_id: int, user_id: int, is_profile: bool = False, current
     cursor.close()
     conn.close()
     return text, InlineKeyboardMarkup(keyboard), (post_type, file_id)
-
-
-# Helper: Group List Page Generator
-async def build_grouplist_page(bot, page: int = 0):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT chat_id, group_title, group_username, added_by, msg_limit FROM group_settings ORDER BY chat_id DESC")
-    groups = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    if not groups:
-        return "❌ မည်သည့် Group မှ မရှိသေးပါ bro!", InlineKeyboardMarkup([])
-
-    per_page = 5
-    total_groups = len(groups)
-    max_page = (total_groups - 1) // per_page
-
-    if page < 0:
-        page = 0
-    if page > max_page:
-        page = max_page
-
-    start_idx = page * per_page
-    page_groups = groups[start_idx : start_idx + per_page]
-
-    text = f"📋 **Bot Joined Groups List** (Total: {total_groups})\n"
-    text += f"📄 Page: {page + 1} / {max_page + 1}\n\n"
-
-    for idx, (chat_id, title, username, added_by, msg_limit) in enumerate(page_groups, start=start_idx + 1):
-        g_title = escape_markdown(title or "Unknown Group")
-        
-        # Link ရယူခြင်း
-        if username:
-            link_str = f"[https://t.me/{username}](https://t.me/{username})"
-        else:
-            try:
-                invite_link = await bot.export_chat_invite_link(chat_id)
-                link_str = f"[Group Link]({invite_link})"
-            except Exception:
-                link_str = "`Private/No Link`"
-
-        # Member Count ရယူခြင်း
-        try:
-            member_count = await bot.get_chat_member_count(chat_id)
-        except Exception:
-            member_count = "Unknown"
-
-        # Adder User Info ရယူခြင်း
-        added_by_str = f"`{added_by}`" if added_by else "Unknown"
-        if added_by:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute("SELECT username FROM users WHERE user_id = %s", (added_by,))
-            u_row = c.fetchone()
-            if u_row and u_row[0]:
-                added_by_str = f"[{escape_markdown(u_row[0])}](tg://user?id={added_by})"
-            c.close()
-            conn.close()
-
-        text += (
-            f"**{idx}. {g_title}**\n"
-            f"• **Group ID:** `{chat_id}`\n"
-            f"• **Link:** {link_str}\n"
-            f"• **Added By:** {added_by_str}\n"
-            f"• **Members:** `{member_count}`\n"
-            f"• **Msg Limit:** `{msg_limit}`\n"
-            f"-----------------------------------\n"
-        )
-
-    # Navigation Buttons
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("◀️ Back", callback_data=f"gplist_{page - 1}"))
-    if page < max_page:
-        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"gplist_{page + 1}"))
-
-    keyboard = [nav_buttons] if nav_buttons else []
-    return text, InlineKeyboardMarkup(keyboard)
 
 
 # Helper: Profile Dashboard Text & Keyboard
@@ -621,44 +511,14 @@ async def show_popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
 
 
-# --- Stats Command (Group Count ပါဝင်သည်) ---
-async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM posts")
-    total_posts = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM reactions")
-    total_reactions = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM group_settings")
-    total_groups = cursor.fetchone()[0]
-
-    cursor.close()
-    conn.close()
-
-    stats_msg = (
-        "📊 **Bot Overall Statistics**\n\n"
-        f"• **Total Users:** `{total_users}`\n"
-        f"• **Total Posts:** `{total_posts}`\n"
-        f"• **Total Reactions:** `{total_reactions}`\n"
-        f"• **Total Active Groups:** `{total_groups}`"
-    )
-
-    await update.message.reply_text(stats_msg, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
-
-
-# --- Admin Command: /add (Global & Group Specific Limit) ---
+# --- Admin Command: /add ---
 async def set_group_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        return
+
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("❌ ဒီ Command ကို Group ထဲမှာပဲ သုံးလို့ရပါတယ် bro!")
         return
 
     if not context.args or not context.args[0].isdigit():
@@ -666,51 +526,20 @@ async def set_group_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     limit = int(context.args[0])
-    chat_type = update.effective_chat.type
+    chat_id = update.effective_chat.id
 
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # DM တွင် ခေါ်ဆိုပါက Global Default Limit ကို ပြောင်းလဲမည်
-    if chat_type in ["private"]:
-        cursor.execute("UPDATE global_config SET value_int = %s WHERE key = 'default_msg_limit'", (limit,))
-        cursor.execute("UPDATE group_settings SET msg_limit = %s", (limit,))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        await update.message.reply_text(f"🌐 **Global Limit Updated!**\n\nGroup အားလုံးအတွက် Default Message Limit ကို `{limit}` ဟု သတ်မှတ်လိုက်ပါပြီ bro!", parse_mode="Markdown")
-        return
-
-    # Group ထဲတွင် ခေါ်ဆိုပါက အဆိုပါ Group တစ်ခုတည်းအတွက် Limit သတ်မှတ်မည်
-    chat = update.effective_chat
-    chat_id = chat.id
-
     cursor.execute("""
-        INSERT INTO group_settings (chat_id, group_title, group_username, msg_limit, current_count) 
-        VALUES (%s, %s, %s, %s, 0)
-        ON CONFLICT (chat_id) DO UPDATE SET 
-            msg_limit = EXCLUDED.msg_limit,
-            group_title = EXCLUDED.group_title,
-            group_username = EXCLUDED.group_username
-    """, (chat_id, chat.title, chat.username, limit))
+        INSERT INTO group_settings (chat_id, msg_limit, current_count) 
+        VALUES (%s, %s, 0)
+        ON CONFLICT (chat_id) DO UPDATE SET msg_limit = EXCLUDED.msg_limit
+    """, (chat_id, limit))
     conn.commit()
     cursor.close()
     conn.close()
 
     await update.message.reply_text(f"✅ ဒီ Group အတွက် Message `{limit}` ကြောင်း ပြည့်တိုင်း Post တစ်ခု အလိုအလျောက် ကျလာပါမည် bro!", parse_mode="Markdown")
-
-
-# --- Admin Command: /grouplist ---
-async def show_group_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return
-
-    if update.effective_chat.type in ["group", "supergroup"]:
-        return
-
-    text, reply_markup = await build_grouplist_page(context.bot, page=0)
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
 
 
 # --- Group Message Listener & Random Post Sender ---
@@ -726,14 +555,9 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     cursor.execute("SELECT msg_limit, current_count FROM group_settings WHERE chat_id = %s", (chat_id,))
     res = cursor.fetchone()
 
-    default_limit = get_global_limit()
-
     if not res:
-        inviter_id = update.effective_user.id if update.effective_user else None
-        cursor.execute("""
-            INSERT INTO group_settings (chat_id, group_title, group_username, added_by, msg_limit, current_count) 
-            VALUES (%s, %s, %s, %s, %s, 1)
-        """, (chat_id, chat.title, chat.username, inviter_id, default_limit))
+        # Default Limit 20 ထားရှိမည်
+        cursor.execute("INSERT INTO group_settings (chat_id, msg_limit, current_count) VALUES (%s, 20, 1)", (chat_id,))
         conn.commit()
         cursor.close()
         conn.close()
@@ -744,7 +568,7 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if new_count >= msg_limit:
         # Counter ကို Reset ပြန်လုပ်မည်
-        cursor.execute("UPDATE group_settings SET current_count = 0, group_title = %s, group_username = %s WHERE chat_id = %s", (chat.title, chat.username, chat_id))
+        cursor.execute("UPDATE group_settings SET current_count = 0 WHERE chat_id = %s", (chat_id,))
         conn.commit()
         cursor.close()
         conn.close()
@@ -752,9 +576,7 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         # Group အတွက် Random Post ဆွဲယူမည်
         post_id = get_random_group_post_id(chat_id)
         if post_id:
-            text, reply_markup, (post_type, file_id) = render_post_ui(
-                post_id, user_id=0, is_group=True, bot_username=context.bot.username
-            )
+            text, reply_markup, (post_type, file_id) = render_post_ui(post_id, user_id=0, is_group=True)
             if post_type == "photo":
                 await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
             elif post_type == "video":
@@ -762,7 +584,7 @@ async def track_group_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
-        cursor.execute("UPDATE group_settings SET current_count = %s, group_title = %s, group_username = %s WHERE chat_id = %s", (new_count, chat.title, chat.username, chat_id))
+        cursor.execute("UPDATE group_settings SET current_count = %s WHERE chat_id = %s", (new_count, chat_id))
         conn.commit()
         cursor.close()
         conn.close()
@@ -795,31 +617,14 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.close()
     conn.close()
 
-    text, reply_markup, _ = render_post_ui(
-        post_id, user_id, is_profile=False, is_group=is_group, bot_username=context.bot.username
-    )
+    text, reply_markup, _ = render_post_ui(post_id, user_id, is_profile=False, is_group=is_group)
     try:
         await query.edit_message_reply_markup(reply_markup=reply_markup)
     except Exception:
         pass
 
 
-async def handle_grouplist_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if user_id != ADMIN_ID:
-        await query.answer("❌ Admin Only!", show_alert=True)
-        return
-
-    await query.answer()
-    page = int(query.data.split("_")[1])
-
-    text, reply_markup = await build_grouplist_page(context.bot, page=page)
-    try:
-        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode="Markdown")
-    except Exception:
-        pass
-
+# (အခြား Callback များ - handle_check_join, handle_feed_nav, handle_admin_delete_post, handle_view_my_posts, handle_profile_nav, handle_delete_post, handle_back_to_profile, handle_open_feed, handle_open_popular စသည်တို့ အဟောင်းအတိုင်းပါဝင်ပါသည်)
 
 async def handle_check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -894,7 +699,7 @@ async def handle_view_my_posts(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     user_id = query.from_user.id
     if not await check_channel_member(context.bot, user_id):
-        await query.answer("⚠ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
+        await query.answer("⚠️️ Channel ကို အရင် Join ပေးပါ bro!", show_alert=True)
         return
     await query.answer()
     conn = get_db_connection()
@@ -1031,19 +836,16 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("feed", show_feed))
     app.add_handler(CommandHandler("profile", show_profile))
     app.add_handler(CommandHandler("popular", show_popular))
-    app.add_handler(CommandHandler("stats", show_stats))
 
-    # Admin Commands
+    # Admin Group Command
     app.add_handler(CommandHandler("add", set_group_limit))
-    app.add_handler(CommandHandler("grouplist", show_group_list))
 
-    # Group Message Listener (Fixed: စာ၊ ပုံ၊ ဗီဒီယို မက်ဆေ့ခ်ျအားလုံးအတွက် အလုပ်လုပ်အောင် ပြောင်းလဲထားပါသည်)
-    app.add_handler(MessageHandler((~filters.COMMAND) & (filters.ChatType.GROUPS), track_group_messages))
+    # Group Text Message Listener
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), track_group_messages))
 
     # Inline Callbacks
     app.add_handler(CallbackQueryHandler(handle_check_join, pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(handle_reaction, pattern="^rec_"))
-    app.add_handler(CallbackQueryHandler(handle_grouplist_nav, pattern="^gplist_"))
     app.add_handler(CallbackQueryHandler(handle_feed_nav, pattern="^feednav_"))
     app.add_handler(CallbackQueryHandler(handle_admin_delete_post, pattern="^admin_dele_"))
     app.add_handler(CallbackQueryHandler(handle_view_my_posts, pattern="^view_my_posts$"))
